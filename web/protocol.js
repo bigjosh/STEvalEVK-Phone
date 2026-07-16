@@ -276,7 +276,9 @@ export class Cx3Console {
    * @returns {Promise<Uint8Array>} the wire frame, or throws after `tries`
    */
   async readFrame(wireTotal, tries = 8) {
-    const request = wireTotal + 65536;
+    // Round the request up to a packet multiple (512 HS / 1024 SS): a
+    // non-multiple buffer can end mid-packet -> "babble" on Android's usbfs.
+    const request = Math.ceil((wireTotal + 65536) / 1024) * 1024;
     let lastErr = "";
     for (let attempt = 1; attempt <= tries; attempt++) {
       try { await this.device.clearHalt("in", this.videoIn); } catch (_) { /* ignore */ }
@@ -294,6 +296,57 @@ export class Cx3Console {
       this.log(`! video attempt ${attempt}/${tries}: ${data.length} bytes, frameStart=${isFrameStart(data)} — retrying`);
     }
     throw new Error(`no complete frame after ${tries} attempts${lastErr ? ` (last: ${lastErr})` : ""}`);
+  }
+
+  /**
+   * Read ONE frame with the read QUEUED BEFORE the stream starts — the
+   * strategy ST's own driver uses, and the robust one on Android where every
+   * WebUSB call crosses an IPC hop and loses the clearHalt->read race against
+   * the CX3's few-ms overflow window (symptom: every attempt reports "stall").
+   *
+   * Sequence per attempt: stop stream (self-clearing cmd, hardware-proven) ->
+   * clearHalt -> queue the full-frame transferIn WITHOUT awaiting -> start
+   * stream -> await the read. The first frame produced lands in the already-
+   * pending transfer, so no host round-trip ever gaps the stream.
+   *
+   * @param {Vd56g3} sensor sensor helper (for stop/start commands)
+   * @param {number} wireTotal exact on-wire frame size
+   * @param {number} [tries]
+   * @returns {Promise<Uint8Array>}
+   */
+  async readFramePrequeued(sensor, wireTotal, tries = 4) {
+    const request = Math.ceil((wireTotal + 65536) / 1024) * 1024;
+    let stalls = 0;
+    for (let attempt = 1; attempt <= tries; attempt++) {
+      await sensor.stopStream();                    // idle the producer
+      try { await this.device.clearHalt("in", this.videoIn); } catch (_) { /* ignore */ }
+      const pending = this.device.transferIn(this.videoIn, request); // queue FIRST
+      pending.catch(() => {});  // pre-attach: no unhandledrejection if it fails early
+      await sensor.startStream();                   // now produce frames into it
+      let data = null;
+      try {
+        // 10 s guard: on a dead video path the transfer never completes.
+        const rd = await Promise.race([
+          pending,
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout (no video data at all)")), 10000)),
+        ]);
+        if (rd.status === "stall") { stalls++; throw new Error("stall"); }
+        data = new Uint8Array(rd.data.buffer, rd.data.byteOffset, rd.data.byteLength);
+      } catch (err) {
+        this.log(`! prequeued video attempt ${attempt}/${tries}: ${err.message}`);
+        continue;
+      }
+      if (data.length >= wireTotal && isFrameStart(data)) return data;
+      this.log(`! prequeued video attempt ${attempt}/${tries}: ${data.length}/${wireTotal} bytes, ` +
+               `frameStart=${isFrameStart(data)} — retrying`);
+    }
+    let msg = `no complete frame after ${tries} pre-queued attempts.`;
+    if (stalls) {
+      msg += ` ${stalls} attempt(s) ended in a stall even with the read queued before the stream ` +
+             `started — the link cannot carry the ~115 MB/s video. This is the USB-2 cable ` +
+             `signature: use a genuine 5 Gbps (USB 3) C-to-C cable.`;
+    }
+    throw new Error(msg);
   }
 }
 

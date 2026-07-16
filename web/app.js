@@ -206,6 +206,21 @@ async function onConnect() {
     log(`Endpoints -> cmdOut #${state.eps.cmdOut} (OUT), ansIn #${state.eps.ansIn} (IN), ` +
         `videoIn #${state.eps.videoIn} (IN) on interfaces [${auto.interfaces.join(", ")}]`);
 
+    // ---- Link-speed check (decisive for video) ---------------------------
+    // At SuperSpeed the bulk endpoints report 1024-byte max packets; at USB-2
+    // High Speed they report 512. The console works at any speed, but the
+    // ~115 MB/s video stream is IMPOSSIBLE over USB 2 — the CX3 just
+    // overflows and stalls EP 0x83 forever ("video attempt ... stall").
+    const pkt = state.eps.videoPacketSize || 0;
+    if (pkt === 512) {
+      setStatus("USB 2 link — video cannot work. Change the cable.");
+      log(`*** LINK IS USB 2 (HighSpeed): video max packet = 512. The video stream`);
+      log(`*** CANNOT flow at this speed — capture WILL fail with stalls. Use a`);
+      log(`*** genuine 5 Gbps (USB 3) C-to-C cable — phone charging cables are USB 2.`);
+    } else {
+      log(`Link looks SuperSpeed (video max packet = ${pkt}). Good for video.`);
+    }
+
     // Build the console + sensor helpers.
     state.console = new Cx3Console(device, state.eps, log);
     state.sensor = new Vd56g3(state.console);
@@ -262,15 +277,16 @@ async function onCapture() {
     log(`Cold-init replayed: streaming ${width}x${height} bpp=${bpp} (no patch).`);
 
     // ---- Read ONE frame off the video bulk-IN (PROTOCOL.md §5.0) ---------
-    // One SINGLE frame-sized transfer — chunked reads tear frames because the
-    // CX3 stalls EP 0x83 whenever the host pauses mid-frame; clearHalt+retry
-    // is inside readFrame.
+    // PRE-QUEUED single transfer: stop the stream, queue the frame-sized read,
+    // then start the stream so the first frame lands in the already-pending
+    // transfer. This removes the clearHalt->read race that Android's WebUSB
+    // IPC latency loses against the CX3's few-ms overflow window.
     setStatus("Reading one frame...");
     const widthBytes = Math.floor((bpp * width) / 8);
     const payloadSize = (2 + height) * widthBytes;   // 2 status lines + rows
     const wireTotal = wireFrameSize(payloadSize);    // + 16 B header/footer per 16 KB chunk
     log(`Expecting ${wireTotal} wire bytes (payload ${payloadSize}).`);
-    const raw = await state.console.readFrame(wireTotal);
+    const raw = await state.console.readFramePrequeued(sensor, wireTotal);
     log(`Read ${raw.length} wire bytes from video bulk-IN.`);
 
     // ---- Stop streaming (0x0202 <- 1, self-clearing — PROTOCOL.md §9.0) ---
@@ -336,7 +352,10 @@ function renderFrame(frame) {
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
+const APP_BUILD = "2026-07-16c (pre-queued frame read + link-speed check)";
+
 window.addEventListener("DOMContentLoaded", () => {
+  log(`App build: ${APP_BUILD}`);
   $("connect").addEventListener("click", onConnect);
   $("capture").addEventListener("click", onCapture);
   if (!("usb" in navigator)) {
