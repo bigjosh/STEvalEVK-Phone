@@ -95,25 +95,32 @@ plumbing: `termux-usb` fd → `libusb_wrap_sys_device` → the same calls.
   `0x0201←04` mode-byte meaning (replayed verbatim); whether plain `I2CWR`
   also works (we use the proven `I2CWRRD` rdlen=0).
 
-## Next actions (in order)
+## 🏆 2026-07-16 (night): GOAL ACHIEVED ON THE PHONE
 
-1. **Try the WebUSB page on the Pixel** (user preference: no CLI on the phone).
-   `web/` now carries all the hardware-validated fixes (start/stop swap,
-   self-clear handshake, §5.0 de-chunking + single-transfer `readFrame`; JS
-   decode is pixel-exact vs Python on a real frame). Open
-   https://bigjosh.github.io/STEvalEVK-Phone/ in Chrome for Android, plug the
-   EVK with a **genuine 5 Gbps C-to-C cable**, Connect → Capture. The one
-   unproven layer is Chrome-Android's `claimInterface` (past EBUSY was likely
-   another claim-holder, possibly the parallel Termux tooling; the device's
-   interfaces are plain vendor 0xFF — not Chrome-blocked). If it fails:
-   replug, reboot, revoke other apps' USB access, check `chrome://device-log`
-   (see web/README.md troubleshooting).
-2. If WebUSB still can't claim: **Termux path** (`termux_grab.py`, fully
-   updated; docs/TERMUX_SETUP.md) — libusb can force-detach where Chrome
-   can't. Requires installing F-Droid Termux + Termux:API.
-3. Robust fallback: **minimal Kotlin APK built by GitHub Actions**
-   (UsbManager `claimInterface(force=true)`, `bulkTransfer`; ~8 files, no
-   external libs; commit a debug.keystore for a stable CI signature). The
-   protocol constants port 1:1 from `termux_grab.py`.
-4. (Optional) If the enhanced firmware is ever wanted, sniff a GUI session that
+**Full-res frame captured on the Pixel 10 XL via the WebUSB page — through a
+USB-2 cable.** Chrome-Android claimed both interfaces (the old EBUSY did not
+recur), the full init replayed over WebUSB, and "slow mode" carried the video
+across the USB-2 link:
+
+- **USB-2 slow mode (line stretch)**: the link check (bulk mps 512 = HighSpeed)
+  auto-enables it. It injects `LINE_LENGTH (0x0300)` = 1236×N just before
+  `CMD_START_STREAM`, dividing the wire rate and fps by N with **zero clock
+  changes**. **4× works on hardware** (~29 MB/s, ~15 fps, full 1120×1360).
+  **12× faults the sensor** (SYSTEM_FSM reads 0xFF = I2C NAK; internal limit
+  somewhere in (4944, 14832] line-clocks; 6× untested). Do NOT retune the PLL
+  or `VT_CLK_DIV` — that faults the sensor the same way (tried first).
+- **Manual exposure slider** (0.5–65 ms → line periods → `COARSE_EXPOSURE`
+  override): needed because the pre-queued read captures the FIRST frame,
+  before auto-exposure can adapt.
+- Empirically confirmed registers: `0x0300` = LINE_LENGTH (readback 1236 =
+  7.69 µs/line @ 160.8 MHz VT ✓ 60 fps × 2168 lines); `0x0312` reads 1010 =
+  MIPI Mbps.
+
+## Next actions (optional polish)
+
+1. Tune exposure defaults / test 6× slow mode if ~10 fps at lower USB load is
+   ever wanted; a genuine 5 Gbps C-to-C cable enables full-rate (slow mode Off).
+2. Termux path (`termux_grab.py`) and the CI-built Kotlin APK remain as
+   researched fallbacks — not needed now that WebUSB works end-to-end.
+3. (Optional) If the enhanced firmware is ever wanted, sniff a GUI session that
    *does* patch and reconstruct the blob — but it is not needed to capture frames.
