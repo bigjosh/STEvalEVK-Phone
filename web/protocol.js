@@ -314,26 +314,48 @@ export class Cx3Console {
    * @param {number} [tries]
    * @returns {Promise<Uint8Array>}
    */
+  /**
+   * Issue (or REUSE) the single outstanding video transfer. WebUSB transfers
+   * cannot be cancelled: if a previous attempt timed out and we issued a NEW
+   * transferIn each retry, abandoned multi-MB transfers stack up on the
+   * endpoint and wedge Chrome's USB stack (observed on Android as a hang
+   * after Capture). So at most ONE video transfer is ever in flight; a
+   * timed-out attempt leaves it pending and the next attempt awaits the SAME
+   * transfer.
+   */
+  _videoRead(request) {
+    if (!this._pendingVideo) {
+      const p = this.device.transferIn(this.videoIn, request);
+      p.catch(() => {});                       // no unhandledrejection if it fails early
+      p.finally(() => { if (this._pendingVideo === p) this._pendingVideo = null; });
+      this._pendingVideo = p;
+    }
+    return this._pendingVideo;
+  }
+
   async readFramePrequeued(sensor, wireTotal, tries = 4) {
     const request = Math.ceil((wireTotal + 65536) / 1024) * 1024;
     let stalls = 0;
     for (let attempt = 1; attempt <= tries; attempt++) {
-      await sensor.stopStream();                    // idle the producer
-      try { await this.device.clearHalt("in", this.videoIn); } catch (_) { /* ignore */ }
-      const pending = this.device.transferIn(this.videoIn, request); // queue FIRST
-      pending.catch(() => {});  // pre-attach: no unhandledrejection if it fails early
-      await sensor.startStream();                   // now produce frames into it
+      const reusing = !!this._pendingVideo;
+      if (!reusing) {
+        await sensor.stopStream();                  // idle the producer
+        try { await this.device.clearHalt("in", this.videoIn); } catch (_) { /* ignore */ }
+        this._videoRead(request);                   // queue FIRST (single outstanding)
+        await sensor.startStream();                 // now produce frames into it
+      }
       let data = null;
       try {
-        // 10 s guard: on a dead video path the transfer never completes.
+        // 10 s guard per attempt; on timeout the transfer stays pending and is
+        // REUSED next attempt (never re-issued — see _videoRead).
         const rd = await Promise.race([
-          pending,
-          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout (no video data at all)")), 10000)),
+          this._videoRead(request),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout (no video data yet)")), 10000)),
         ]);
         if (rd.status === "stall") { stalls++; throw new Error("stall"); }
         data = new Uint8Array(rd.data.buffer, rd.data.byteOffset, rd.data.byteLength);
       } catch (err) {
-        this.log(`! prequeued video attempt ${attempt}/${tries}: ${err.message}`);
+        this.log(`! prequeued video attempt ${attempt}/${tries}${reusing ? " (reused pending)" : ""}: ${err.message}`);
         continue;
       }
       if (data.length >= wireTotal && isFrameStart(data)) return data;
@@ -369,11 +391,17 @@ export class Cx3Console {
     const tEnd = performance.now() + 5000; // hard cap
     while (got < warmupFrames && performance.now() < tEnd) {
       try {
-        const rd = await this.device.transferIn(this.videoIn, request);
+        // Single-outstanding-transfer discipline here too (see _videoRead),
+        // with a short race so a quiet pipe can't hang the loop.
+        const rd = await Promise.race([
+          this._videoRead(request),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("frame timeout")), 2000)),
+        ]);
         if (rd.status === "stall") throw new Error("stall");
         const d = new Uint8Array(rd.data.buffer, rd.data.byteOffset, rd.data.byteLength);
         if (d.length >= wireTotal && isFrameStart(d)) { kept = d; got++; }
-      } catch (_) {
+      } catch (err) {
+        if (err.message === "frame timeout") break;  // pipe quiet; keep what we have
         try { await this.device.clearHalt("in", this.videoIn); } catch (_2) { /* ignore */ }
       }
     }

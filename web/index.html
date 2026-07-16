@@ -105,7 +105,8 @@
 
   <pre id="log"></pre>
 
-  <!-- ES modules; app.js imports protocol.js. No external scripts. -->
-  <script type="module" src="./app.js"></script>
+  <!-- ES modules; app.js imports protocol.js. No external scripts.
+       ?v= busts stale cached JS whenever the HTML updates. -->
+  <script type="module" src="./app.js?v=16h"></script>
 </body>
 </html>

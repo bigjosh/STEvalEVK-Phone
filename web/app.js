@@ -11,7 +11,7 @@
 import {
   Cx3Console, Vd56g3,
   replayColdInit, decodeFrame, wireFrameSize,
-} from "./protocol.js";
+} from "./protocol.js?v=16h"; // ?v= keeps protocol.js in lockstep with app.js
 
 // VID:PID of the EVK (PROTOCOL.md §1).
 const VENDOR_ID = 0x0553;
@@ -319,9 +319,14 @@ async function onCapture() {
     // (observed: the slider had no effect). Manual mode overrides 0x044C to 2
     // (manual) so the slider value sticks; Auto mode leaves AE on and instead
     // warms it up by streaming ~15 frames and keeping the last.
-    const manualExposure = $("expmode").value === "manual";
+    // Defensive: a stale cached index.html (GitHub Pages caches HTML up to
+    // ~10 min) may lack newer controls — degrade gracefully, never crash.
+    const expmodeEl = $("expmode");
+    if (!expmodeEl) log("WARNING: stale page HTML cached (no exposure-mode control) — " +
+                        "hard-refresh for the full UI; defaulting to Manual exposure.");
+    const manualExposure = expmodeEl ? expmodeEl.value === "manual" : true;
     const linePeriodS = (LINE_LENGTH_DEFAULT * slowFactor) / VT_CLOCK_HZ;
-    const wantMs = parseFloat($("expms").value) || 15;
+    const wantMs = parseFloat($("expms") ? $("expms").value : "15") || 15;
     const expLines = Math.min(FRAME_LENGTH_LINES - 8,
                               Math.max(1, Math.round(wantMs / 1000 / linePeriodS)));
     const effMs = expLines * linePeriodS * 1000;
@@ -454,13 +459,14 @@ function renderFrame(frame) {
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16g (manual exposure via EXP_MODE=2 + AE warm-up mode; readbacks)";
+const APP_BUILD = "2026-07-16h (single-outstanding video transfer fix; bench-validated exposure: " +
+  "EXP_MODE=2 manual confirmed, ladder 120/480/1900 lines -> mean 111/248/723, AE warm-up 15 frames/1s ok)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);
   $("connect").addEventListener("click", onConnect);
   $("capture").addEventListener("click", onCapture);
-  $("expms").addEventListener("input", () => {
+  if ($("expms")) $("expms").addEventListener("input", () => {
     $("expmsval").textContent = parseFloat($("expms").value).toFixed(1);
   });
   if (!("usb" in navigator)) {
