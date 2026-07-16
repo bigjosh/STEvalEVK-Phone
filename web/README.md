@@ -79,8 +79,30 @@ encoding, `CFG2WR`, and the full init sequence are all confirmed from USBPcap
 captures. Remaining unknowns are on-device only: running it in Chrome on the
 Pixel, and decoding a real frame (the captures' video is snaplen-truncated).
 
+## Troubleshooting: "Unable to claim interface"
+
+If Connect logs `claimInterface(...) failed: Unable to claim interface`, that is a
+usbfs `EBUSY` from Chrome's Android backend — **not** a bug in this app (the
+device's interfaces are vendor-class `0xFF`, so they aren't Chrome-blocked). The
+app already: forces `selectConfiguration(1)`, retries the claim, selects alt 0,
+releases stale handles on reconnect, and aborts with guidance rather than masking
+the error. If it still fails:
+
+1. **Read `chrome://device-log` on the phone** right after the failure — it prints
+   `Failed to claim interface:` with the exact errno and, if a driver is bound,
+   its name. `EBUSY` + a driver = a kernel driver holds it; `EBUSY` + no driver =
+   another consumer (a stale tab/PWA, or a PC running the ST GUI on the same cable).
+2. **Unplug/replug** the EVK and close other tabs/apps that opened it; retry.
+3. **Enable `chrome://flags/#automatic-usb-detach`**, relaunch Chrome, retry.
+   (Chrome only auto-detaches allowlisted drivers — `cdc_acm`/`usblp`/`ftdi_sio` —
+   so this helps only if the bound driver is one of those.)
+4. **If a non-allowlisted kernel driver is bound**, WebUSB cannot force-detach it
+   from JavaScript. Use the **Phase-1 Termux/pyusb path** ([../docs/TERMUX_SETUP.md](../docs/TERMUX_SETUP.md)),
+   which uses libusb — that *can* force-detach and claim. Same protocol, same
+   captured init sequence.
+
 ## Safety / scope
 
 The app does nothing beyond USB: no credentials, no network calls except the
-same-origin `fetch()` of the two firmware files. It reads exactly one frame per
+same-origin `fetch()` of the firmware file. It reads exactly one frame per
 Capture and always attempts to stop streaming afterward.

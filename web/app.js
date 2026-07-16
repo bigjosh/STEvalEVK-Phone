@@ -136,30 +136,69 @@ async function onConnect() {
       return;
     }
 
+    // Release any device we still hold from a previous attempt in this tab — a
+    // lingering claim is a common Android "Unable to claim interface" (EBUSY)
+    // source when the user retries Connect.
+    if (state.device) {
+      try {
+        for (const i of state.claimedInterfaces) { try { await state.device.releaseInterface(i); } catch (_) {} }
+        await state.device.close();
+      } catch (_) { /* ignore */ }
+    }
     state.device = device;
+    state.claimedInterfaces = [];
     log(`Selected: ${device.productName || "device"} ` +
         `(VID 0x${device.vendorId.toString(16)}, PID 0x${device.productId.toString(16)})`);
 
     await device.open();
     log("Device opened.");
 
-    // Select configuration 1 (composite device; MI_00 = "Stream").
-    if (device.configuration === null) await device.selectConfiguration(1);
-    log(`Configuration ${device.configuration.configurationValue} active.`);
+    // ALWAYS issue SET_CONFIGURATION, even when Chrome already reports config 1
+    // active. On Android's usbfs backend, skipping it commonly leaves the handle
+    // without proper interface ownership and claimInterface then fails.
+    try {
+      await device.selectConfiguration(1);
+    } catch (err) {
+      log(`selectConfiguration(1): ${err.message} (continuing)`);
+    }
+    log(`Configuration ${device.configuration ? device.configuration.configurationValue : "?"} active.`);
 
     // Discover the 3 bulk endpoints across ALL interfaces, then claim every
     // interface they live on (console on if1, video on if0 — see PROTOCOL.md §1).
     const auto = discoverEndpoints(device.configuration);
     state.eps = applyOverrides(auto);
+    const claimed = [];
     for (const ifnum of auto.interfaces) {
-      try {
-        await device.claimInterface(ifnum);
-        log(`Claimed interface ${ifnum}.`);
-      } catch (err) {
-        log(`claimInterface(${ifnum}) failed: ${err.message}`);
+      let ok = false;
+      for (let attempt = 1; attempt <= 4 && !ok; attempt++) {
+        try {
+          await device.claimInterface(ifnum);
+          // Put the interface's endpoints into the "selected alternate" state so
+          // transfers are allowed (else: "endpoint is not part of a claimed and
+          // selected alternate interface").
+          try { await device.selectAlternateInterface(ifnum, 0); } catch (_) { /* alt 0 usually implicit */ }
+          ok = true;
+          claimed.push(ifnum);
+          log(`Claimed interface ${ifnum}.`);
+        } catch (err) {
+          log(`claimInterface(${ifnum}) attempt ${attempt}/4: ${err.message}`);
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+      if (!ok) {
+        for (const c of claimed) { try { await device.releaseInterface(c); } catch (_) {} }
+        state.claimedInterfaces = [];
+        setStatus(`Could not claim interface ${ifnum}.`);
+        log(`ABORT: interface ${ifnum} could not be claimed ("Unable to claim interface" = usbfs EBUSY).`);
+        log(`Diagnose on the phone: open chrome://device-log and find "Failed to claim interface" + its errno/driver.`);
+        log(`Try: (1) unplug/replug the EVK, close other tabs/apps that opened it, retry;`);
+        log(`     (2) enable chrome://flags/#automatic-usb-detach, relaunch Chrome, retry.`);
+        log(`If a kernel driver is bound and won't detach, WebUSB can't force it — use the Phase-1`);
+        log(`Termux/pyusb path (docs/TERMUX_SETUP.md), which CAN force-detach and claim.`);
+        return;
       }
     }
-    state.claimedInterfaces = auto.interfaces;
+    state.claimedInterfaces = claimed;
     // Reflect discovered values back into the (blank) inputs as placeholders.
     if ($("epCmd").value === "") $("epCmd").placeholder = String(auto.cmdOut);
     if ($("epAns").value === "") $("epAns").placeholder = String(auto.ansIn);
