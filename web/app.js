@@ -11,7 +11,7 @@
 import {
   Cx3Console, Vd56g3,
   replayColdInit, decodeFrame, wireFrameSize,
-} from "./protocol.js?v=16i"; // ?v= keeps protocol.js in lockstep with app.js
+} from "./protocol.js?v=16k"; // ?v= keeps protocol.js in lockstep with app.js
 
 // VID:PID of the EVK (PROTOCOL.md §1).
 const VENDOR_ID = 0x0553;
@@ -334,15 +334,17 @@ async function onCapture() {
     const effMs = expLines * linePeriodS * 1000;
     let mods = { preStart: [] };
     if (manualExposure) {
-      // ST's documented GROUP_PARAM_HOLD latch (UM2602 Table 26/27): hold ->
-      // update EXP_MODE + MANUAL_COARSE_EXPOSURE -> release (applied atomically).
+      // BARE writes, deliberately WITHOUT GROUP_PARAM_HOLD: bench bisect
+      // showed the GPH release (0x0448<-0) is processed asynchronously by the
+      // sensor firmware — if START_STREAM follows within a few ms, the held
+      // updates are silently dropped (race). Bare CONTEXT writes in standby
+      // latch reliably at START_STREAM. (GPH remains correct for LIVE changes
+      // during streaming, where its atomicity actually matters.)
       mods.preStart.push(
-        { reg: 0x0448, val: [1] },                                       // GROUP_PARAM_HOLD
         { reg: 0x044C, val: [2] },                                       // EXP_MODE = Manual
         { reg: 0x044E, val: [expLines & 0xff, (expLines >> 8) & 0xff] }, // MANUAL_COARSE_EXPOSURE
-        { reg: 0x0448, val: [0] },                                       // release
       );
-      log(`Manual exposure (GPH latch): ${wantMs.toFixed(1)} ms -> ${expLines} lines ` +
+      log(`Manual exposure: ${wantMs.toFixed(1)} ms -> ${expLines} lines ` +
           `(${effMs.toFixed(1)} ms effective at ${(linePeriodS * 1e6).toFixed(1)} us/line` +
           `${effMs < wantMs - 0.3 ? " — CLAMPED; a slower mode allows longer exposures" : ""}).`);
     } else {
@@ -475,7 +477,8 @@ function renderFrame(frame) {
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16i (UM2602-documented GPH exposure latch; datasheet+hardware validated)";
+const APP_BUILD = "2026-07-16k (manual exposure: bare pre-START writes — GPH release races " +
+  "START_STREAM; injection anchored to START_STREAM value, not the thermal reads)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);

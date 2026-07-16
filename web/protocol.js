@@ -655,8 +655,15 @@ export async function replayColdInit(sensor, url, mods = null) {
   let injected = false;
   for (const step of steps) {
     if (step.op === "write") {
-      // Inject extra statics writes right before the stream starts (slow mode).
-      if (step.reg === REG.CMD_START_STREAM && preStart.length && !injected) {
+      // Inject extra writes right before the stream ACTUALLY starts. NB: the
+      // captured init writes 0x0201 THREE times — twice with value 0x04
+      // (THSENS_READ, thermal) and finally with 0x01 (START_STREAM). Matching
+      // on the register alone fired at the first thermal read, and the init's
+      // own later 0x044C<-0 / 0x044E<-1000 writes then clobbered the manual
+      // exposure block back to auto (the "slider does nothing" bug). Match the
+      // START_STREAM value too.
+      if (step.reg === REG.CMD_START_STREAM && step.val.length === 1 && step.val[0] === 1
+          && preStart.length && !injected) {
         injected = true;
         for (const w of preStart) {
           sensor.console.log(`~ slow-mode inject: reg 0x${w.reg.toString(16).padStart(4, "0")} <- [${w.val.join(",")}]`);

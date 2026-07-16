@@ -534,8 +534,15 @@ ISB_LONG_PIPE_OVERFLOW, 0xc00 CSI_LANE_DESYNC) and the device needs a reset
 - `0x0450` **MANUAL_DIGITAL_GAIN_CH0** (FP5.8, `0x0100`=×1.0): ×1..×8.
 - **Latch protocol (GROUP_PARAM_HOLD `0x0448`)**: write 1 → update the
   EXP_MODE/MANUAL_*/AE_*/ROI registers → write 0; firmware applies atomically
-  on release (AE frozen while held). Works in SW_STANDBY **and live during
-  STREAMING** (bench: live exposure change mid-stream works).
+  on release (AE frozen while held). Works live during STREAMING (bench: live
+  exposure change mid-stream works).
+  **⚠ GPH race (hardware-found, not in the doc):** the release (`0x0448←0`)
+  is processed **asynchronously** — if `START_STREAM` is issued within a few
+  ms of the release, the held updates are silently dropped (bench bisect:
+  GPH+immediate-start fails; GPH+300 ms settle works; bare writes work).
+  For pre-stream configuration in SW_STANDBY, use **bare CONTEXT writes,
+  no GPH** — they latch reliably at `START_STREAM`. Reserve GPH for live
+  mid-stream updates.
 - Applied-value readbacks (STATUS, per frame): `0x0064` coarse, `0x0068`
   analog gain, `0x006A` digital gain, `0x0072` AE_MODE, `0x0073` AE_STATUS
   (1=converged), `0x0074` AE_MEAN_ENERGY. (`0x004C` is the TEMPERATURE.)
