@@ -57,10 +57,21 @@ deployed. Same-origin fetch under Pages needs no CORS config.
 cold-init sequence from `../firmware/vd56g3_cold_init.json` (PROTOCOL.md §9): the
 exact ordered commands ST's GUI sent to a cold, **unpatched** VD56G3 that then
 streamed — register writes (`I2CWRRD` rdlen=0), `CLKWR`/`CFG2WR`/`NRST`/`IOSET`/
-`IOCFGWR`, ending at `CMD_STREAMING`. A cold capture proved the sensor streams
-with **no FW patch** (`FWPATCH_REVISION` = 0), so there's nothing to download. It
-streams **RAW10 at 1120×1360**. The optional `loadMainPatch`/`loadVtPatch` helpers
+`IOCFGWR`, ending at `CMD_START_STREAM (0x0201) <- 1` (the sensor is streaming
+when the replay returns). A cold capture proved the sensor streams with **no FW
+patch** (`FWPATCH_REVISION` = 0), so there's nothing to download. It streams
+**RAW10 at 1120×1360**. The optional `loadMainPatch`/`loadVtPatch` helpers
 remain for the *enhanced* firmware but are not called by default.
+
+**2026-07-16 — this whole flow is hardware-validated** (via the identical
+Python implementation on the reference PC, which captured a clean photo; the JS
+decode is pixel-exact against it on a real captured frame). Three fixes from
+that session are load-bearing (PROTOCOL.md §9.0/§5.0): command registers
+self-clear and must be polled to 0 (`sendCommand`); `0x0201` starts / `0x0202`
+stops streaming (ST's names suggest the opposite — the replay used to end with
+the captured session's *Stop* click); and frames arrive as 16 KB header+footer
+chunks read with ONE frame-sized transfer (`readFrame`) because the CX3 stalls
+the pipe if the host pauses mid-frame.
 
 ## Configurable knobs
 
@@ -72,12 +83,14 @@ remain for the *enhanced* firmware but are not called by default.
 - **CSI config** — sent as the captured `CFG2WR` bytes (`CFG2WR_CAPTURED`),
   replayed verbatim.
 
-## Verified against real hardware (PROTOCOL.md §8–9)
+## Verified against real hardware (PROTOCOL.md §5.0, §8–9)
 
 Endpoint addresses, reply grammar (`OK <HH…>`), the `I2CWRRD`-rdlen0 write
-encoding, `CFG2WR`, and the full init sequence are all confirmed from USBPcap
-captures. Remaining unknowns are on-device only: running it in Chrome on the
-Pixel, and decoding a real frame (the captures' video is snaplen-truncated).
+encoding, `CFG2WR`, the full init sequence, the command handshake, the wire
+chunk format, and the frame decode are all confirmed against the live board
+(photo captured on the PC 2026-07-16; JS decode pixel-exact vs the Python
+reference on a real frame). The only remaining unknown is Chrome-on-Android
+itself: whether `claimInterface` succeeds on the Pixel (see below).
 
 ## Troubleshooting: "Unable to claim interface"
 

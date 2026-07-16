@@ -43,6 +43,64 @@ REG_STATUS_OUT_ROI_Y_SIZE = 0x94   # u16 -> y_size
 _STATUS_LINE_COUNT = 2
 _SECOND_LINE_THRESHOLD = 0x7D
 
+# --- On-wire frame chunking (hardware-confirmed 2026-07-16) -----------------
+# The CX3 delivers each frame on the video bulk-IN as a train of fixed
+# 16384-byte DMA chunks (the final chunk is short), each laid out as:
+#
+#   [16-byte header][payload_len bytes payload][16-byte footer]*
+#
+#   header:  bytes 0-3   magic 10 01 02 00
+#            bytes 4-5   u16 chunk index within the frame, 1-based
+#            bytes 6-7   u16 (counter high word; purpose not needed)
+#            bytes 8-11  u32 frame sequence, little-endian
+#            bytes 12-15 u32 payload length (0x3FE0 = 16352 for full chunks)
+#   footer:  16 bytes, absent on the final short chunk.
+#
+# Full chunks: 16 + 16352 + 16 = 16384. For 1120x1360 RAW10 the frame payload
+# is (2+1360)*1400 = 1,906,800 B -> 117 chunks -> 1,910,528 B on the wire
+# (both USBPcap captures show exactly this size per video URB; verified live
+# by de-chunking a captured frame to a clean image). ST's native driver strips
+# this framing before its decoder runs — PROTOCOL.md §5 describes the
+# POST-driver payload. De-chunking is applied only when the magic is present,
+# so post-driver payloads (offline tests, ST-tool dumps) keep decoding.
+WIRE_FRAME_MAGIC = b"\x10\x01\x02\x00"
+WIRE_HEADER_LEN = 16
+WIRE_CHUNK_STRIDE = 16384
+WIRE_CHUNK_PAYLOAD = 16352
+
+
+def wire_frame_size(payload_size: int) -> int:
+    """Total on-wire bytes for a frame whose post-driver payload is *payload_size*."""
+    chunks = (payload_size + WIRE_CHUNK_PAYLOAD - 1) // WIRE_CHUNK_PAYLOAD
+    return payload_size + chunks * 16 + (chunks - 1) * 16
+
+
+def strip_wire_chunks(raw: bytes) -> Tuple[bytes, "int | None"]:
+    """
+    Reassemble the post-driver frame payload from the CX3 wire chunking.
+
+    Returns ``(payload, frame_seq)``; if *raw* does not start with the chunk
+    magic it is passed through unchanged with ``frame_seq=None`` (already a
+    post-driver payload).
+    """
+    if len(raw) < WIRE_HEADER_LEN or bytes(raw[:4]) != WIRE_FRAME_MAGIC:
+        return bytes(raw), None
+    out = bytearray()
+    frame_seq = None
+    off = 0
+    n = len(raw)
+    while off + WIRE_HEADER_LEN <= n:
+        if bytes(raw[off : off + 4]) != WIRE_FRAME_MAGIC:
+            raise ValueError(f"wire chunk magic missing at offset {off}")
+        if frame_seq is None:
+            frame_seq = int.from_bytes(raw[off + 8 : off + 12], "little")
+        plen = int.from_bytes(raw[off + 12 : off + 16], "little")
+        if plen > WIRE_CHUNK_PAYLOAD:
+            raise ValueError(f"wire chunk at {off} declares payload {plen} > {WIRE_CHUNK_PAYLOAD}")
+        out += raw[off + WIRE_HEADER_LEN : off + WIRE_HEADER_LEN + plen]
+        off += WIRE_CHUNK_STRIDE
+    return bytes(out), frame_seq
+
 
 # --------------------------------------------------------------- status lines
 def _extract8(reg: int, raw: np.ndarray, width: int, bpp: int) -> int:
@@ -125,7 +183,15 @@ def decode_frame(raw, width: int) -> Tuple[Dict, np.ndarray]:
         ``metadata`` = dict(width, height, bits_per_pixels, frame_counter,
         current_context); ``image`` = 2-D uint8 (RAW8) or uint16 (RAW10).
     """
-    raw_frame = np.frombuffer(raw, dtype=np.uint8) if isinstance(raw, (bytes, bytearray)) else np.asarray(raw, dtype=np.uint8)
+    # 0. Reassemble the post-driver payload from the CX3 wire chunking if
+    #    present (see strip_wire_chunks above). ST's driver does the same.
+    if isinstance(raw, np.ndarray):
+        raw = raw.tobytes()
+    payload, frame_seq = strip_wire_chunks(bytes(raw))
+    if frame_seq is not None:
+        logger.debug("de-chunked wire frame: %d -> %d bytes (frame_seq=%d)",
+                     len(raw), len(payload), frame_seq)
+    raw_frame = np.frombuffer(payload, dtype=np.uint8)
 
     # 1. bits per pixel (status reg 0x5B).
     bits_per_pixel = _extract8(REG_STATUS_FORMAT_CTRL, raw_frame, width, bpp=8)
@@ -172,6 +238,7 @@ def decode_frame(raw, width: int) -> Tuple[Dict, np.ndarray]:
         "bits_per_pixels": bits_per_pixel,
         "frame_counter": frame_counter,
         "current_context": current_context,
+        "frame_seq": frame_seq,  # from the wire header; None for post-driver payloads
     }
     logger.info(
         "decoded frame: %dx%d bpp=%d frame_counter=%d ctx=%d",

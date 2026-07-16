@@ -42,13 +42,32 @@ CX3_PID = 0x040A
 LIBUSB_OPTION_NO_DEVICE_DISCOVERY = 2
 
 
+def _desktop_backend():
+    """
+    Prefer an explicit libusb-1.0 backend, using the DLL bundled by the
+    ``libusb-package`` wheel when installed (Windows has no system
+    libusb-1.0.dll). Without this, pyusb can silently fall back to the legacy
+    libusb0 backend, whose bulk reads fail on multi-MB video transfers
+    (observed: ``libusb0-dll:err [_usb_reap_async]``). Returns ``None`` to let
+    pyusb pick its default chain when libusb-package isn't available.
+    """
+    try:
+        import libusb_package  # type: ignore
+    except ImportError:
+        return None
+    backend = libusb1.get_backend(find_library=libusb_package.find_library)
+    if backend is not None:
+        logger.debug("Using libusb-1.0 backend from libusb-package.")
+    return backend
+
+
 def open_by_vid_pid(vid: int = CX3_VID, pid: int = CX3_PID) -> "usb.core.Device":
     """
-    Desktop-Linux fallback: find + open the device by VID:PID via normal pyusb
+    Desktop fallback: find + open the device by VID:PID via normal pyusb
     enumeration. Sets the first configuration. Not usable on Android (see
     module docstring) — use :func:`open_from_fd` there.
     """
-    dev = usb.core.find(idVendor=vid, idProduct=pid)
+    dev = usb.core.find(idVendor=vid, idProduct=pid, backend=_desktop_backend())
     if dev is None:
         raise RuntimeError(
             f"USB device {vid:04X}:{pid:04X} not found. On a phone use "

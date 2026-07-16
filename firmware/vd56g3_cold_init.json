@@ -1,6 +1,6 @@
 {
  "source": "captures/cold",
- "note": "verbatim cold-init replay to CMD_STREAMING<-1; sensor streams UNPATCHED (FWPATCH_REVISION read 0 throughout). Writes are I2CWRRD rdlen=0.",
+ "note": "verbatim cold-init replay ending at CMD_START_STREAM (0x0201)<-1 (hw-confirmed: 0x0201 starts streaming, 0x0202 stops; command regs self-clear \u2014 poll to 0 before the next command). Sensor streams UNPATCHED (FWPATCH_REVISION read 0 throughout). Writes are I2CWRRD rdlen=0.",
  "steps": [
   {
    "op": "cmd",
@@ -671,13 +671,6 @@
   {
    "op": "write",
    "reg": 513,
-   "val": [
-    1
-   ]
-  },
-  {
-   "op": "write",
-   "reg": 514,
    "val": [
     1
    ]

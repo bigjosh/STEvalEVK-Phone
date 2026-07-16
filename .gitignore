@@ -11,3 +11,11 @@ captures/*
 # The main FW patch blob (once captured) — large binary, drop it in but don't
 # necessarily commit it.
 firmware/vd56g3_main_patch.bin
+
+# Captured frames and probe dumps (personal photos / large binaries) — local only.
+frame.jpg
+frame.pgm
+frame.raw
+probe_*.bin
+probe_*.jpg
+probe_*.pgm

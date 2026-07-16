@@ -10,7 +10,7 @@
 
 import {
   Cx3Console, Vd56g3,
-  replayColdInit, decodeFrame,
+  replayColdInit, decodeFrame, wireFrameSize,
 } from "./protocol.js";
 
 // VID:PID of the EVK (PROTOCOL.md §1).
@@ -252,32 +252,36 @@ async function onCapture() {
     }
 
     // ---- Cold-init: replay the hardware-captured sequence (PROTOCOL.md §9) --
-    // No FW patch — the VD56G3 streams unpatched. This plays the exact ordered
-    // commands ST's GUI sent (register writes via I2CWRRD rdlen=0, CLKWR/CFG2WR/
-    // NRST/IOSET/IOCFGWR), ending at CMD_STREAMING<-1.
+    // No FW patch — the VD56G3 streams unpatched. Plays the exact ordered
+    // commands ST's GUI sent, with the §9.0 self-clear command handshake, and
+    // ends at CMD_START_STREAM<-1: the sensor is STREAMING when this returns.
     setStatus("Replaying captured cold-init...");
     const geo = await replayColdInit(sensor);  // resolves firmware/ in dev or deployed
     const { width, height } = geo;
     bpp = geo.bpp;
     log(`Cold-init replayed: streaming ${width}x${height} bpp=${bpp} (no patch).`);
 
-    // ---- Read ONE frame off the video bulk-IN ----------------------------
+    // ---- Read ONE frame off the video bulk-IN (PROTOCOL.md §5.0) ---------
+    // One SINGLE frame-sized transfer — chunked reads tear frames because the
+    // CX3 stalls EP 0x83 whenever the host pauses mid-frame; clearHalt+retry
+    // is inside readFrame.
     setStatus("Reading one frame...");
     const widthBytes = Math.floor((bpp * width) / 8);
-    // Total payload = (2 status lines + height rows) * widthBytes.
-    const target = (2 + height) * widthBytes;
-    const raw = await readOneFrame(target);
-    log(`Read ${raw.length}/${target} bytes from video bulk-IN.`);
+    const payloadSize = (2 + height) * widthBytes;   // 2 status lines + rows
+    const wireTotal = wireFrameSize(payloadSize);    // + 16 B header/footer per 16 KB chunk
+    log(`Expecting ${wireTotal} wire bytes (payload ${payloadSize}).`);
+    const raw = await state.console.readFrame(wireTotal);
+    log(`Read ${raw.length} wire bytes from video bulk-IN.`);
 
-    // ---- 12. Stop streaming ----------------------------------------------
-    try { await sensor.stopStream(); log("Streaming stopped (CMD_STREAMING <- 0)."); }
+    // ---- Stop streaming (0x0202 <- 1, self-clearing — PROTOCOL.md §9.0) ---
+    try { await sensor.stopStream(); log("Streaming stopped (CMD_STOP_STREAM 0x0202 <- 1)."); }
     catch (err) { log(`stopStream warning: ${err.message}`); }
 
-    // ---- Decode + render (PROTOCOL.md §5) --------------------------------
+    // ---- Decode + render (PROTOCOL.md §5: de-chunk, strip status lines) ---
     setStatus("Decoding frame...");
     const frame = decodeFrame(raw, width, bpp);
     log(`Decoded: ${frame.width}x${frame.height}, ${frame.bpp}bpp, ` +
-        `frame#${frame.frameCounter}, ctx=${frame.currentContext}.`);
+        `frame#${frame.frameCounter}, seq=${frame.frameSeq}, ctx=${frame.currentContext}.`);
     renderFrame(frame);
 
     setStatus(`Frame captured: ${frame.width}x${frame.height} ${frame.bpp}bpp.`);
@@ -291,39 +295,10 @@ async function onCapture() {
   }
 }
 
-/**
- * Read one full frame by looping transferIn on the video endpoint until we've
- * reassembled `target` bytes (or a transfer returns nothing). clearHalt+retry is
- * handled inside Cx3Console.readVideo. A short read count guard prevents an
- * infinite loop if the pipe goes quiet.
- */
-async function readOneFrame(target) {
-  const buf = new Uint8Array(target);
-  let filled = 0;
-  let emptyReads = 0;
-  // Request in reasonably large chunks; the device caps to its packet size.
-  const chunk = 512 * 1024;
-  // Bulk-IN reads must request a whole multiple of the endpoint's max packet
-  // size, else Chrome can complete with status "babble" (overflow). Round up.
-  const pkt = state.eps.videoPacketSize || 1024;
-  while (filled < target) {
-    let want = Math.min(chunk, target - filled);
-    want = Math.ceil(want / pkt) * pkt; // multiple of packet size (may overshoot; clamped on copy)
-    const part = await state.console.readVideo(want);
-    if (part.length === 0) {
-      if (++emptyReads > 8) {
-        log("Video pipe returned no data repeatedly — stopping frame read.");
-        break;
-      }
-      continue;
-    }
-    emptyReads = 0;
-    const n = Math.min(part.length, target - filled);
-    buf.set(part.subarray(0, n), filled);
-    filled += n;
-  }
-  return filled === target ? buf : buf.subarray(0, filled);
-}
+// (Frame reading lives in Cx3Console.readFrame — one single frame-sized
+// transfer per attempt, per PROTOCOL.md §5.0. The old chunked reassembly loop
+// was removed: the CX3 stalls EP 0x83 whenever the host pauses mid-frame, so
+// chunked reads can only ever produce torn frames.)
 
 // ===========================================================================
 // Render a decoded grayscale frame to the canvas + wire up the JPEG download.

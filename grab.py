@@ -83,24 +83,43 @@ def setup_logging(verbosity: int) -> None:
     )
 
 
-def read_one_frame(console, frame_size: int, chunk: int, timeout_ms: int) -> bytes:
-    """
-    Reassemble exactly one frame (``frame_size`` bytes) off the video bulk-IN.
+# First 6 bytes of a frame's FIRST wire chunk: magic + u16 chunk index 1
+# (hardware-confirmed; see evk/raw.py wire-chunk layout).
+WIRE_FRAME_START = b"\x10\x01\x02\x00\x01\x00"
 
-    Reads in ``chunk``-sized transfers until we have ``frame_size`` bytes
-    (PROTOCOL.md §5/§6 step 11). Extra bytes from the final transfer are kept —
-    the decoder tolerates a payload at least as large as required.
+
+def read_one_frame(console, wire_total: int, timeout_ms: int, max_reads: int = 10) -> bytes:
     """
-    buf = bytearray()
-    while len(buf) < frame_size:
-        want = min(chunk, frame_size - len(buf) + chunk)  # allow a full trailing transfer
-        data = console.read_video(want, timeout_ms=timeout_ms)
-        if not data:
-            logger.warning("empty video transfer (%d/%d bytes so far)", len(buf), frame_size)
-            break
-        buf.extend(data)
-        logger.debug("video: %d/%d bytes", len(buf), frame_size)
-    return bytes(buf)
+    Read one complete on-wire frame (``wire_total`` bytes) off the video
+    bulk-IN with a SINGLE large URB per attempt.
+
+    Why single-URB (hardware-confirmed): the CX3 stalls EP 0x83 when its DMA
+    buffers overflow — which they do within milliseconds whenever the host
+    pauses between chunked reads at the stream's ~115 MB/s. One URB for the
+    whole frame drains at line rate with no host round-trips (ST's driver
+    submits exactly frame-sized URBs). After a stall, ``clear_halt`` makes the
+    CX3 resume cleanly at the next frame boundary, so each attempt is:
+    clear_halt -> read (frame + slack; the end-of-frame short packet
+    terminates the URB) -> validate the frame-start chunk header.
+    """
+    import usb.core  # local import: module must stay importable without pyusb
+
+    request = wire_total + 65536
+    for attempt in range(max_reads):
+        try:
+            console.video_device.clear_halt(console.ep_video_in)
+        except Exception as err:  # noqa: BLE001
+            logger.debug("clear_halt(video) failed: %s", err)
+        try:
+            data = console.read_video(request, timeout_ms=timeout_ms)
+        except usb.core.USBError as err:
+            logger.warning("video read failed (%s); retry %d/%d", err, attempt + 1, max_reads)
+            continue
+        if data[:6] == WIRE_FRAME_START and len(data) >= wire_total:
+            return bytes(data)
+        logger.warning("discarding non-frame read: %d bytes, frame-start=%s (retry %d/%d)",
+                       len(data), data[:6] == WIRE_FRAME_START, attempt + 1, max_reads)
+    return b""
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -161,22 +180,26 @@ def main(argv: Optional[list] = None) -> int:
 
         # 4. Start streaming and read one frame.
         x_size_in_bytes = int(bpp * width / 8)
-        # Full payload = 2 status lines + `height` image rows (PROTOCOL.md §5).
-        frame_size = (2 + height) * x_size_in_bytes
-        logger.info("Expecting frame_size=%d bytes (%dx%d bpp=%d, row=%d B)",
-                    frame_size, width, height, bpp, x_size_in_bytes)
+        # Post-driver payload = 2 status lines + `height` rows; the wire adds
+        # 16 B header + 16 B footer per 16 KB chunk (see evk/raw.py).
+        payload_size = (2 + height) * x_size_in_bytes
+        wire_total = rawmod.wire_frame_size(payload_size)
+        logger.info("Expecting %d wire bytes (payload %d = (2+%d) rows x %d B; %dx%d bpp=%d)",
+                    wire_total, payload_size, height, x_size_in_bytes, width, height, bpp)
 
-        sensor.start_stream()
+        # The captured replay ends with CMD_START_STREAM<-1 (sensor already
+        # streaming, FSM=3); only the legacy synthetic path needs an explicit
+        # start here.
+        if args.synthetic:
+            sensor.start_stream()
         try:
-            raw_frame = read_one_frame(
-                console, frame_size, chunk=x_size_in_bytes * 16, timeout_ms=args.video_timeout_ms
-            )
+            raw_frame = read_one_frame(console, wire_total, timeout_ms=args.video_timeout_ms)
         finally:
             sensor.stop_stream()
 
-        if len(raw_frame) < frame_size:
+        if len(raw_frame) < wire_total:
             logger.error("Captured %d/%d bytes — incomplete frame. Not saving.",
-                         len(raw_frame), frame_size)
+                         len(raw_frame), wire_total)
             logger.error("Bulk video stream likely starving: confirm the genuine 5 Gbps "
                          "C-to-C cable, and that the video endpoint is right "
                          "(--ep-video-in 0x83). See PROTOCOL.md §9.")

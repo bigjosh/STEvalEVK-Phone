@@ -20,10 +20,23 @@ CURRENT_CONTEXT       = 0x0056  # u8
 FORMAT_CTRL_STATUS    = 0x005B  # u8   (status-line copy of format ctrl / bpp)
 
 # --- commands ------------------------------------------------------------
-CMD_BOOT              = 0x0200  # u8   write 1 to boot after main patch load
-CMD_STBY              = 0x0201  # u8
-CMD_STREAMING         = 0x0202  # u8   write 1 to start streaming, 0 to stop
+# Command registers self-clear to 0 once the sensor consumes the command
+# (capture + hardware confirmed 2026-07-16) — poll the register back to 0
+# before issuing the next command (Vd56g3.send_command).
+#
+# ⚠ SEMANTICS (hardware-confirmed 2026-07-16, contra ST's constant names):
+#   0x0201 <- 0x01  STARTS streaming  (SYSTEM_FSM 2 -> 3)
+#   0x0202 <- 0x01  STOPS  streaming  (SYSTEM_FSM 3 -> 2)
+# In captures/cold, 0x0201<-01 precedes all 242 streamed frames and 0x0202<-01
+# is the GUI's Stop at session end; probing the live sensor reproduced both
+# transitions. 0x0201<-0x04 is also seen around init/stop (mode unknown).
+CMD_BOOT              = 0x0200  # u8   write 1 to boot the sensor FW
+CMD_START_STREAM      = 0x0201  # u8   write 1 to START streaming (FSM -> 3)
+CMD_STOP_STREAM       = 0x0202  # u8   write 1 to STOP streaming (FSM -> 2)
 CMD_DEBUG             = 0x0203  # u8   1=enter patch mode, 2=exit  (VT patch)
+# Legacy aliases (ST vdx6gx_constants.py names — misleading, kept for grep):
+CMD_STBY              = CMD_START_STREAM
+CMD_STREAMING         = CMD_STOP_STREAM
 
 # --- static stream config ------------------------------------------------
 STATICS_FORMAT_CTRL   = 0x030A  # u16  bits/pixel (8 or 10)

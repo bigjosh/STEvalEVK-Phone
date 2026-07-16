@@ -235,14 +235,82 @@ class Vd56g3:
 
     # =============================================================== stream
     def start_stream(self) -> None:
-        """Start sensor streaming: ``CMD_STREAMING`` (0x0202) <- 1 (PROTOCOL.md §6)."""
-        logger.info("CMD_STREAMING <- 1 (start)")
-        self.write8(reg.CMD_STREAMING, 1)
+        """Start sensor streaming: ``CMD_START_STREAM`` (0x0201) <- 1, then wait
+        for ``SYSTEM_FSM`` = 3. Hardware-confirmed semantics (2026-07-16): ST's
+        constant names had start/stop swapped — see firmware/vd56g3_registers.py."""
+        logger.info("CMD_START_STREAM (0x0201) <- 1")
+        self.send_command(reg.CMD_START_STREAM, 1)
+        self.wait_system_fsm(3, timeout_s=5.0, label="post-start_stream")
 
     def stop_stream(self) -> None:
-        """Stop sensor streaming: ``CMD_STREAMING`` (0x0202) <- 0."""
-        logger.info("CMD_STREAMING <- 0 (stop)")
-        self.write8(reg.CMD_STREAMING, 0)
+        """Stop sensor streaming: ``CMD_STOP_STREAM`` (0x0202) <- 1 (FSM -> 2)."""
+        logger.info("CMD_STOP_STREAM (0x0202) <- 1")
+        self.send_command(reg.CMD_STOP_STREAM, 1)
+
+    def send_command(self, cmd_reg: int, value: int, timeout_s: float = 2.0) -> bool:
+        """
+        Write a VD56G3 command register with the **capture-confirmed handshake**:
+        command registers (``CMD_BOOT`` 0x0200, 0x0201, ``CMD_STREAMING``
+        0x0202) self-clear to 0 once the sensor has consumed the command. The
+        GUI reads the register back after every command write (captures/cold:
+        write 0x0202<-01 at #703 is bracketed by reads of 0x0202 at #702 and
+        #704-706; 0x0201<-01 at #344 cleared after ~2 polls ~25 ms). Writing
+        the *next* command while the previous one is still nonzero gets it
+        silently dropped — observed on hardware as SYSTEM_FSM stuck at 2 after
+        a back-to-back 0x0201<-01 / 0x0202<-01 replay.
+
+        Returns True once the register reads 0, False on timeout (logged).
+        """
+        import time
+
+        self.write8(cmd_reg, value)
+        deadline = time.monotonic() + timeout_s
+        last = -1
+        while time.monotonic() < deadline:
+            try:
+                last = self.read8(cmd_reg)
+            except Exception as err:  # noqa: BLE001 - keep the sequence alive
+                logger.debug("command readback 0x%04X failed (%s)", cmd_reg, err)
+                last = -1
+            if last == 0:
+                logger.info("command 0x%04X <- 0x%02X consumed", cmd_reg, value)
+                return True
+            time.sleep(0.01)
+        logger.warning("command 0x%04X <- 0x%02X NOT consumed after %.1fs (reads back %d)",
+                       cmd_reg, value, timeout_s, last)
+        return False
+
+    def wait_system_fsm(self, target: int, timeout_s: float = 3.0, label: str = "") -> int:
+        """
+        Poll ``SYSTEM_FSM`` (0x0028) until it reaches *target*.
+
+        The cold capture shows ST's GUI polling 0x0028 dozens of times around
+        the boot/standby/streaming commands (~4.5 s between ``CMD_STBY``<-1 and
+        ``CMD_STREAMING``<-1) — a back-to-back replay outruns the sensor's
+        state machine and the streaming command is silently ignored. FSM walks
+        1 (ready-to-boot) -> 2 (standby) -> 3 (streaming) per PROTOCOL.md §9.
+
+        Returns the last value read. Logs a warning (does not raise) on
+        timeout so the verbatim replay continues; callers can inspect the
+        returned state.
+        """
+        import time
+
+        deadline = time.monotonic() + timeout_s
+        val = -1
+        while time.monotonic() < deadline:
+            try:
+                val = self.read8(reg.SYSTEM_FSM)
+            except Exception as err:  # noqa: BLE001 - keep the replay alive
+                logger.debug("SYSTEM_FSM read failed (%s)", err)
+                val = -1
+            if val == target:
+                logger.info("SYSTEM_FSM=%d reached%s", val, f" ({label})" if label else "")
+                return val
+            time.sleep(0.05)
+        logger.warning("SYSTEM_FSM=%d after %.1fs, wanted %d%s — continuing",
+                       val, timeout_s, target, f" ({label})" if label else "")
+        return val
 
     # =============================================================== cold init
     def apply_stream_registers(self, bpp: int, cfg: dict | None = None) -> Tuple[int, int]:
@@ -301,18 +369,44 @@ class Vd56g3:
             doc = json.load(f)
         steps = doc["steps"]
 
+        import time
+
         writes: dict[int, bytes] = {}
         bpp = 8
+        # The captured session ends with the GUI's *Stop* click —
+        # CMD_STOP_STREAM (0x0202) <- 01 — which older extractions kept as the
+        # "final init step" (this silently stopped the stream right after
+        # starting it). Skip any trailing stop.
+        while steps and steps[-1].get("op") == "write" \
+                and steps[-1]["reg"] == reg.CMD_STOP_STREAM:
+            logger.info("skipping trailing CMD_STOP_STREAM step (the captured session's Stop)")
+            steps = steps[:-1]
+
+        _CMD_REGS = (reg.CMD_BOOT, reg.CMD_START_STREAM, reg.CMD_STOP_STREAM)
         for step in steps:
             if step["op"] == "write":
+                regaddr = step["reg"]
                 val = bytes(step["val"])
-                self.write_reg_bytes(step["reg"], val)
-                writes[step["reg"]] = val
+                writes[regaddr] = val
+                # Command registers need the capture-confirmed self-clear
+                # handshake (see send_command) — a back-to-back replay leaves
+                # the sensor busy and the next command is silently dropped.
+                if regaddr in _CMD_REGS and len(val) == 1:
+                    self.send_command(regaddr, val[0])
+                    if regaddr == reg.CMD_BOOT:
+                        self.wait_system_fsm(2, timeout_s=2.0, label="post-CMD_BOOT")
+                    elif regaddr == reg.CMD_START_STREAM and val[0] == 1:
+                        self.wait_system_fsm(3, timeout_s=5.0, label="post-CMD_START_STREAM")
+                else:
+                    self.write_reg_bytes(regaddr, val)
+                    time.sleep(0.005)
             else:
                 args = bytes(step.get("args", []))
                 if step["cmd"] == "CFG2WR" and len(args) >= 11:
                     bpp = args[10]  # byte[10] of the CFG2WR payload = bits/pixel
                 self.console.query(step["cmd"], args)
+                # GUI spaces the NRST reset toggles 76-494 ms apart.
+                time.sleep(0.1 if step["cmd"] == "NRST" else 0.005)
 
         def _u16(reg: int, default: int = 0) -> int:
             b = writes.get(reg)

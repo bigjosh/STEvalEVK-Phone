@@ -92,16 +92,49 @@ def test_stream_output_ctrl_is_0x0335():
     assert (w, h) == (1104, 1360)
 
 
+class _ReplayFake:
+    """Answers reads like real hardware (hw-confirmed 2026-07-16): command
+    registers self-clear to 0, SYSTEM_FSM walks 2 after CMD_BOOT and 3 after
+    CMD_START_STREAM (0x0201) <- 1."""
+
+    def __init__(self):
+        self.calls = []
+        self.fsm = 1
+
+    def query(self, kw, args=b""):
+        args = bytes(args)
+        self.calls.append((kw, args))
+        if kw == "I2CWRRD" and len(args) >= 5:
+            rdlen = (args[0] << 8) | args[1]
+            regad = (args[3] << 8) | args[4]
+            if rdlen == 0:  # write
+                if regad == 0x0200 and args[5:] == b"\x01":
+                    self.fsm = 2
+                elif regad == 0x0201 and args[5:] == b"\x01":
+                    self.fsm = 3
+                elif regad == 0x0202 and args[5:] == b"\x01":
+                    self.fsm = 2
+                return b"OK"
+            if regad == 0x0028:  # SYSTEM_FSM
+                return b"OK %02X" % self.fsm
+            return b"OK" + b" 00" * rdlen
+        return b"OK"
+
+
 def test_replay_cold_init():
-    # The hardware-captured replay: plays firmware/vd56g3_cold_init.json, needs no
-    # patch, ends at CMD_STREAMING(0x0202)<-1, and reports the streamed geometry.
-    fc = _FakeConsole()
+    # The hardware-captured replay: plays firmware/vd56g3_cold_init.json, needs
+    # no patch, ends by STARTING the stream (CMD_START_STREAM 0x0201 <- 1 —
+    # hardware-confirmed semantics), and must NOT replay the captured session's
+    # trailing Stop (0x0202 <- 1).
+    fc = _ReplayFake()
     w, h, bpp = Vd56g3(fc).replay_cold_init()
-    # last write is CMD_STREAMING <- 1 via I2CWRRD rdlen=0
-    assert fc.calls[-1] == ("I2CWRRD", bytes([0x00, 0x00, 0x20, 0x02, 0x02, 0x01]))
+    writes = [a for kw, a in fc.calls if kw == "I2CWRRD" and a[:2] == b"\x00\x00"]
+    assert writes[-1] == bytes([0x00, 0x00, 0x20, 0x02, 0x01, 0x01])       # start
+    assert bytes([0x00, 0x00, 0x20, 0x02, 0x02, 0x01]) not in writes       # no stop
+    assert fc.fsm == 3                                                     # streaming
     assert (w, h, bpp) == (1120, 1360, 10)
-    # no VT-patch-sized burst of writes (unpatched); modest command count
-    assert len(fc.calls) < 200
+    # no VT-patch-sized burst; modest command count incl. handshake readbacks
+    assert len(fc.calls) < 400
 
 
 def test_cfgwr_payload():
@@ -203,6 +236,37 @@ def test_decode_raw10_unpack():
     row = np.array([[0xFF, 0x00, 0xAA, 0x55, 0b11100100]], dtype=np.uint8)  # b4 = 0xE4
     dec = rawmod.decode_raw_10(row)
     assert [int(x) for x in dec[0]] == [1020, 1, 682, 343]
+
+
+def test_wire_frame_chunking():
+    # Hardware-confirmed CX3 wire framing: 16384-byte chunks of
+    # [16 B header][<=16352 B payload][16 B footer], final chunk short with no
+    # footer; header = magic + u16 chunk idx + u16 + u32 frame seq + u32 len.
+    payload = _synth_frame(192, 8, 100)  # (2+100)*192 = 19584 B -> 2 chunks
+    wire = bytearray()
+    off, idx = 0, 1
+    while off < len(payload):
+        part = payload[off : off + rawmod.WIRE_CHUNK_PAYLOAD]
+        wire += (rawmod.WIRE_FRAME_MAGIC + idx.to_bytes(2, "little") + b"\x00\x00"
+                 + (5).to_bytes(4, "little") + len(part).to_bytes(4, "little"))
+        wire += part
+        off += len(part)
+        idx += 1
+        if off < len(payload):
+            wire += b"\xEE" * 16  # inter-chunk footer
+    assert rawmod.wire_frame_size(len(payload)) == len(wire)
+
+    stripped, seq = rawmod.strip_wire_chunks(bytes(wire))
+    assert stripped == payload and seq == 5
+
+    meta, img = rawmod.decode_frame(bytes(wire), 192)
+    assert meta["frame_seq"] == 5
+    assert meta["height"] == 100
+    assert img.shape == (100, 192)
+
+    # post-driver payloads (no magic) pass through untouched
+    passthrough, seq2 = rawmod.strip_wire_chunks(payload)
+    assert passthrough == payload and seq2 is None
 
 
 def _run_all():

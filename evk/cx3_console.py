@@ -110,7 +110,12 @@ class Cx3Console:
         ep_video_in: Optional[int] = None,
     ) -> None:
         self.device = device
-        self._claimed_interfaces: list[int] = []
+        # Video transfers may live on a *different* libusb device than the
+        # console (Windows/libusbK splits the composite device per function —
+        # see _discover_video_cross_device). Defaults to the console device.
+        self.video_device = device
+        # Claimed (device, interface) pairs — released in close().
+        self._claimed_interfaces: list[tuple["usb.core.Device", int]] = []
 
         intf = self._select_interface(interface_number)
         self.interface_number = intf.bInterfaceNumber
@@ -145,6 +150,14 @@ class Cx3Console:
             self.ep_video_in = self._discover_video_cross_interface()
             if self.ep_video_in is not None:
                 logger.info("video bulk-IN resolved on a separate interface: 0x%02X", self.ep_video_in)
+
+        # Windows/libusbK: usbccgp splits the composite device so each vendor
+        # function enumerates as its OWN libusb device — the console handle's
+        # configuration then only contains interface 1, and the video interface
+        # 0 / EP 0x83 lives on a sibling 0553:040A device (hardware-confirmed
+        # 2026-07-16: console at bus=0 addr=254, video at bus=0 addr=255).
+        if self.ep_video_in is None:
+            self.ep_video_in = self._discover_video_cross_device()
 
     # ------------------------------------------------------------------ setup
     def _select_interface(self, interface_number: Optional[int]):
@@ -226,18 +239,19 @@ class Cx3Console:
                 )
         return cmd_out, ans_in, video_in
 
-    def _claim(self, interface_number: int) -> None:
+    def _claim(self, interface_number: int, device: Optional["usb.core.Device"] = None) -> None:
         """Detach any kernel driver and claim the vendor interface."""
+        dev = device if device is not None else self.device
         try:
-            if self.device.is_kernel_driver_active(interface_number):
+            if dev.is_kernel_driver_active(interface_number):
                 logger.debug("Detaching kernel driver from interface %d", interface_number)
-                self.device.detach_kernel_driver(interface_number)
+                dev.detach_kernel_driver(interface_number)
         except (NotImplementedError, usb.core.USBError):
             # Windows/libusbK and Android usbfs typically report "not implemented".
             pass
-        usb.util.claim_interface(self.device, interface_number)
-        if interface_number not in self._claimed_interfaces:
-            self._claimed_interfaces.append(interface_number)
+        usb.util.claim_interface(dev, interface_number)
+        if (dev, interface_number) not in self._claimed_interfaces:
+            self._claimed_interfaces.append((dev, interface_number))
         logger.debug("Claimed interface %d", interface_number)
 
     def _discover_video_cross_interface(self) -> Optional[int]:
@@ -262,6 +276,62 @@ class Cx3Console:
                                intf.bInterfaceNumber, err)
                 continue
             return ins[0].bEndpointAddress
+        return None
+
+    def _discover_video_cross_device(self) -> Optional[int]:
+        """
+        Find (and claim) the video bulk-IN on a *sibling libusb device*.
+
+        On Windows, usbccgp splits a composite device per function; with
+        libusbK bound to each function, libusb enumerates one 0553:040A device
+        per interface. The console handle then never sees the video interface,
+        so we enumerate same-VID:PID siblings and claim the first one exposing
+        a bulk-IN endpoint. Sets ``self.video_device``.
+
+        Under Android/Termux fd adoption this is a harmless no-op: enumeration
+        is disabled (NO_DEVICE_DISCOVERY), so no siblings are ever found —
+        there the whole device is one handle and video resolves in-device.
+        """
+        try:
+            siblings = usb.core.find(
+                find_all=True,
+                idVendor=self.device.idVendor,
+                idProduct=self.device.idProduct,
+                backend=getattr(self.device, "backend", None),  # same backend as the console
+            )
+        except (usb.core.USBError, ValueError) as err:
+            logger.debug("sibling enumeration unavailable: %s", err)
+            return None
+        for dev in siblings or []:
+            if dev.bus == self.device.bus and dev.address == self.device.address:
+                continue
+            try:
+                cfg = dev.get_active_configuration()
+            except usb.core.USBError:
+                try:
+                    dev.set_configuration()
+                    cfg = dev.get_active_configuration()
+                except usb.core.USBError as err:
+                    logger.debug("skipping sibling (no active config): %s", err)
+                    continue
+            for intf in cfg:
+                _outs, ins = self._bulk_endpoints(intf)
+                if not ins:
+                    continue
+                try:
+                    self._claim(intf.bInterfaceNumber, device=dev)
+                except usb.core.USBError as err:
+                    logger.warning("could not claim sibling video interface %d: %s",
+                                   intf.bInterfaceNumber, err)
+                    continue
+                self.video_device = dev
+                logger.info(
+                    "video bulk-IN resolved on sibling libusb device "
+                    "(bus=%s addr=%s interface %d): 0x%02X",
+                    dev.bus, dev.address, intf.bInterfaceNumber,
+                    ins[0].bEndpointAddress,
+                )
+                return ins[0].bEndpointAddress
         return None
 
     # ------------------------------------------------------------- low level
@@ -358,7 +428,7 @@ class Cx3Console:
             raise Cx3ConsoleError(
                 "No video bulk-IN endpoint resolved; pass ep_video_in explicitly."
             )
-        data = self.device.read(self.ep_video_in, length, timeout=timeout_ms)
+        data = self.video_device.read(self.ep_video_in, length, timeout=timeout_ms)
         return bytes(data)
 
     # -------------------------------------------------------- convenience API
@@ -376,13 +446,15 @@ class Cx3Console:
 
     def close(self) -> None:
         """Release all claimed interfaces and dispose of pyusb resources."""
-        for ifnum in self._claimed_interfaces:
+        for dev, ifnum in self._claimed_interfaces:
             try:
-                usb.util.release_interface(self.device, ifnum)
+                usb.util.release_interface(dev, ifnum)
             except usb.core.USBError as err:
                 logger.debug("release_interface(%d) failed: %s", ifnum, err)
         self._claimed_interfaces = []
         usb.util.dispose_resources(self.device)
+        if self.video_device is not self.device:
+            usb.util.dispose_resources(self.video_device)
 
     def __enter__(self) -> "Cx3Console":
         return self

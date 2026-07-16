@@ -1,18 +1,29 @@
 # STATE.md — what works, what's blocked
 
-_Updated 2026-07-15. Companion to `handoff.md`, `PROTOCOL.md`, `DECISIONS_QUEUE.md`._
+_Updated 2026-07-16. Companion to `handoff.md`, `PROTOCOL.md`, `DECISIONS_QUEUE.md`._
 
 ## Where we are
 
-Phase 0 (protocol discovery) is done. **Phase 1 (Termux pyusb) and Phase 2
-(WebUSB) are written, reviewed, and offline-tested (12/12).** Two real captures
-(warm + cold) have been fully decoded, and **the one hard blocker is RESOLVED**:
-the cold capture proves the **VD56G3 streams with no firmware patch at all**
-(`FWPATCH_REVISION` reads 0 throughout while ~16 MB of frames flow). The exact
-hardware-proven cold-init sequence is captured to `firmware/vd56g3_cold_init.json`
-and both impls now replay it verbatim. What remains is running it on the actual
-Pixel (no on-device run yet) and validating a real decoded frame (both captures'
-video is snaplen-truncated).
+**🎉 REAL PHOTO CAPTURED (2026-07-16), on the Windows PC, entirely through our
+reimplemented stack:** `python grab.py --auto --out frame.jpg -v` → clean
+1120×1360 RAW10 photo, exit 0, ~3 s. Every open protocol question is now
+hardware-answered. The PC run surfaced and fixed four issues that would have
+burned many phone debug cycles:
+
+1. **Command registers self-clear** — must poll back to 0 after each command
+   or the next one is dropped (PROTOCOL.md §9.0; `Vd56g3.send_command`).
+2. **Start/stop were swapped**: `0x0201←01` STARTS streaming, `0x0202←01`
+   STOPS. The extracted replay used to end with the captured session's Stop
+   click, killing the stream right after starting it (§9.0; JSON regenerated).
+3. **Wire chunk framing on EP 0x83**: 16 KB chunks with 16-byte header/footer
+   (§5.0) — the old decode produced garbage even on a good read; de-chunking
+   is implemented in `evk/raw.py` + `termux_grab.py`.
+4. **The CX3 stalls EP 0x83 on DMA overflow**: read one whole frame per bulk
+   transfer with `clear_halt` between attempts (§5.0); chunked reads tear.
+
+All of this is ported into **`termux_grab.py`** (its de-chunk/decode logic is
+validated against the real captured frame). What remains is only the on-phone
+plumbing: `termux-usb` fd → `libusb_wrap_sys_device` → the same calls.
 
 ## Works / established (high confidence)
 
@@ -42,8 +53,9 @@ video is snaplen-truncated).
   shadow-defines `STREAM_STATICS_OUTPUT_CTRL` (0x0096 → **0x0335** wins under
   `import *`), so the stream-enable write goes to **0x0335** — fixed in the
   register file, both impls, and PROTOCOL.md.
-- **Offline regression test passes** (`tests/test_protocol_offline.py`, 10/10;
-  no hardware/pyusb needed) plus a CI workflow (`.github/workflows/ci.yml`)
+- **Offline regression test passes** (`tests/test_protocol_offline.py`, 13/13;
+  no hardware/pyusb needed — now includes the wire-chunk format and the
+  corrected command handshake) plus a CI workflow (`.github/workflows/ci.yml`)
   that compiles Python, runs the tests, and syntax-checks the WebUSB JS.
 - **Two real captures URB-parsed** (`tools/parse_usb_capture.py`) and confirmed
   against hardware: **bulk endpoint addresses** (cmd-OUT `0x05`, answer-IN `0x85`,
@@ -63,41 +75,45 @@ video is snaplen-truncated).
 
 ## Blocked / open
 
-- **✅ RESOLVED — the FW patch is not required.** The whole premise (patch each
-  cold init) was wrong for basic streaming. The `captures/cold` session read
-  `FWPATCH_REVISION`/`VTIMING` = 0 the entire time and still streamed. So we do
-  **not** need ST's missing `Resources/…patch….bin`; the VT patch (already
-  extracted) is likewise optional. The GUI patches only when explicitly enhancing
-  the sensor; plain RAW capture doesn't need it. Main-patch and VT-patch code
-  paths remain, gated off by default, for anyone who wants the enhanced firmware.
-- **Not yet hardware-verified** (needs the device or an untruncated capture):
-  running the replay on the actual Pixel; a full **real-frame decode** (both
-  captures' video is snaplen-truncated at 64 KB/URB); whether `termux-usb` +
-  `libusb_wrap_sys_device` clears SELinux on the Pixel 10 XL. Minor/unconfirmed:
-  the `CFG2WR` v2 field semantics (bytes replayed verbatim, so it doesn't matter)
-  and whether `I2CWR` also works (we use the proven `I2CWRRD` rdlen=0).
-- **Highest-risk code path: `evk/usb_termux.py` fd adoption.** It reaches into
-  pyusb's private libusb1 internals to reuse the Termux-provided fd; it is
-  structurally correct against pyusb 1.2.x but unrun on a real Pixel. If it
-  fails on-device, the fallback is the raw `libusb1`/`usb1` ctypes path noted in
-  `docs/TERMUX_SETUP.md`. The rest of the stack (console/register/decode) is
-  offline-tested and low-risk.
+- **✅ RESOLVED — the FW patch is not required** (cold capture; re-confirmed
+  live: the sensor streamed a real photo with `FWPATCH_REVISION` = 0).
+- **✅ RESOLVED — real-frame decode validated.** A live frame (1,910,528 wire
+  bytes) de-chunks to exactly 1,906,800 payload bytes and decodes to a clean
+  photo; status-line metadata (FORMAT_CTRL=10, OUT_ROI_Y_SIZE=1360, live
+  FRAME_COUNTER) parses correctly.
+- **Windows quirk (PC path only):** libusb's libusb0 fallback backend breaks on
+  the video reads — `evk/usb_termux.py` now forces the libusb-1.0 backend via
+  `libusb-package`. Under the old libusb0 backend the composite device also
+  enumerates as TWO devices (one per interface); `evk/cx3_console.py` handles
+  both presentations (cross-interface + cross-device video discovery).
+- **Still phone-only unknowns** (all plumbing, no protocol): `termux-usb`
+  permission/fd handoff, `libusb_wrap_sys_device` on the Pixel 10 XL,
+  SuperSpeed negotiation + VBUS over the phone's C-to-C cable. Note the
+  bundled Pixel cable is USB-2-only — console will work but video will starve;
+  use a genuine 5 Gbps cable.
+- Minor/unconfirmed: `CFG2WR` v2 field semantics (replayed verbatim — moot);
+  `0x0201←04` mode-byte meaning (replayed verbatim); whether plain `I2CWR`
+  also works (we use the proven `I2CWRRD` rdlen=0).
 
 ## Next actions (in order)
 
-1. **Run `grab.py` on the Pixel** (`termux-usb -e … --fd`). This is now the
-   critical path — the init sequence is hardware-proven, so the main unknowns are
-   just the `usb_termux.py` fd adoption (fall back to the raw-`usb1` recipe in
-   `docs/TERMUX_SETUP.md` if pyusb internals differ) and reading one frame off
-   endpoint `0x83`. Iterate until a JPG lands.
-2. **Validate the decoded frame.** Both captures' video is snaplen-truncated, so
-   the decoder is only synthetic-tested. First real frame from the Pixel confirms
-   the status-line strip + RAW10 unpack at 1120×1360; adjust width if the ROI
-   differs from the captured 1120.
-3. **Phase 2 is deployed** → https://bigjosh.github.io/STEvalEVK-Phone/ (via
-   `.github/workflows/pages.yml`). Open in Chrome for Android and try Connect →
-   Capture. The EVK splits endpoints across two interfaces (video `0x83` on if0,
-   console `0x05`/`0x85` on if1 — confirmed from the device descriptor); the web
-   app now claims both. WebUSB has not been run against the device yet.
+1. **Try the WebUSB page on the Pixel** (user preference: no CLI on the phone).
+   `web/` now carries all the hardware-validated fixes (start/stop swap,
+   self-clear handshake, §5.0 de-chunking + single-transfer `readFrame`; JS
+   decode is pixel-exact vs Python on a real frame). Open
+   https://bigjosh.github.io/STEvalEVK-Phone/ in Chrome for Android, plug the
+   EVK with a **genuine 5 Gbps C-to-C cable**, Connect → Capture. The one
+   unproven layer is Chrome-Android's `claimInterface` (past EBUSY was likely
+   another claim-holder, possibly the parallel Termux tooling; the device's
+   interfaces are plain vendor 0xFF — not Chrome-blocked). If it fails:
+   replug, reboot, revoke other apps' USB access, check `chrome://device-log`
+   (see web/README.md troubleshooting).
+2. If WebUSB still can't claim: **Termux path** (`termux_grab.py`, fully
+   updated; docs/TERMUX_SETUP.md) — libusb can force-detach where Chrome
+   can't. Requires installing F-Droid Termux + Termux:API.
+3. Robust fallback: **minimal Kotlin APK built by GitHub Actions**
+   (UsbManager `claimInterface(force=true)`, `bulkTransfer`; ~8 files, no
+   external libs; commit a debug.keystore for a stable CI signature). The
+   protocol constants port 1:1 from `termux_grab.py`.
 4. (Optional) If the enhanced firmware is ever wanted, sniff a GUI session that
    *does* patch and reconstruct the blob — but it is not needed to capture frames.

@@ -5,7 +5,13 @@ extract_cold_init.py — build firmware/vd56g3_cold_init.json from a cold USBPca
 Parses a USBPcap capture of ST's GUI performing a *cold* init (unplug → capture →
 GUI launch), extracts the ordered console command sequence on the CX3 console
 (command bulk-OUT), drops the pure register reads / GPIO-config introspection,
-and emits the essential replay up to and including CMD_STREAMING (0x0202) <- 1.
+and emits the essential replay up to and including CMD_START_STREAM (0x0201) <- 1.
+
+⚠ Command semantics (hardware-confirmed 2026-07-16, contra ST's constant
+names): 0x0201 <- 01 STARTS streaming, 0x0202 <- 01 STOPS it. The capture's
+final 0x0202 <- 01 is the GUI's Stop click at session end and is EXCLUDED
+from the replay (an earlier version kept it, which stopped the stream right
+after starting it).
 
 Register writes are recognized as I2CWRRD with read-length 0 (the GUI's write
 encoding — see PROTOCOL.md §3.1/§8). Output steps are either:
@@ -57,16 +63,20 @@ def main():
         if is_write(kw, a):
             reg = (a[3] << 8) | a[4]
             val = a[5:]
+            if reg == 0x0201 and val == [0x01]:
+                steps.append({"op": "write", "reg": reg, "val": list(val)})
+                break  # CMD_START_STREAM <- 1: the stream is running; anything
+                       # after (incl. the session's 0x0202<-1 Stop) is excluded
             steps.append({"op": "write", "reg": reg, "val": list(val)})
-            if reg == 0x0202 and val == [0x01]:
-                break  # stop after CMD_STREAMING <- 1
         else:
             steps.append({"op": "cmd", "cmd": kw, "args": list(a)})
 
     doc = {
         "source": src,
-        "note": "verbatim cold-init replay to CMD_STREAMING<-1; sensor streams UNPATCHED "
-                "(FWPATCH_REVISION read 0 throughout). Writes are I2CWRRD rdlen=0.",
+        "note": "verbatim cold-init replay ending at CMD_START_STREAM (0x0201)<-1 "
+                "(hw-confirmed: 0x0201 starts streaming, 0x0202 stops; command regs "
+                "self-clear — poll to 0 before the next command). Sensor streams "
+                "UNPATCHED (FWPATCH_REVISION read 0 throughout). Writes are I2CWRRD rdlen=0.",
         "steps": steps,
     }
     with open(out, "w") as f:

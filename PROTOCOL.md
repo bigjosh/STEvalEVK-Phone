@@ -255,7 +255,47 @@ pixel_clock=160_800_000 Hz`.
 
 ## 5. Frame format on the video bulk-IN [binary-confirmed from decoder]
 
-From `vdx6gx_frame_decoding.py` + `image_sensor_python_sdk.py`:
+### 5.0 On-wire chunk framing ✅ [hardware-confirmed 2026-07-16]
+
+Everything below §5.0 describes ST's **post-driver payload** — but the CX3
+delivers each frame on EP `0x83` wrapped in a chunk framing that ST's native
+driver strips before its decoder runs. Recovered by de-chunking a live frame
+to a clean image (the framing was invisible in the USBPcap captures because
+their video payloads were snaplen-truncated at 64 KB):
+
+- The frame arrives as a train of **16384-byte chunks** (final chunk short):
+
+  ```
+  [16-byte header][payload_len bytes payload][16-byte footer]
+  ```
+
+  - header bytes 0-3: magic `10 01 02 00`
+  - header bytes 4-5: u16 **chunk index within the frame, 1-based**
+  - header bytes 6-7: u16 (counter high word; not needed for decode)
+  - header bytes 8-11: u32 **frame sequence**, little-endian
+  - header bytes 12-15: u32 **payload length** (`0x3FE0` = 16352 for full
+    chunks; the actual remainder for the final chunk)
+  - the 16-byte footer is absent on the final short chunk.
+
+- Full chunks carry 16 + 16352 + 16 = 16384 bytes. For 1120×1360 RAW10 the
+  post-driver payload is (2+1360)·1400 = **1,906,800 B** → 117 chunks →
+  **1,910,528 B on the wire** — exactly the per-URB completion size in both
+  captures. General formula: `wire = payload + 16·chunks + 16·(chunks-1)`,
+  `chunks = ceil(payload / 16352)`.
+- Concatenating the chunk payloads yields the §5 payload (2 status lines +
+  image rows). Implementations: `evk/raw.py strip_wire_chunks`,
+  `termux_grab.py strip_wire_chunks`.
+- **Reading strategy (hardware-confirmed):** the CX3 **stalls EP 0x83 when
+  its DMA overflows**, which happens within milliseconds whenever the host
+  pauses mid-frame (the stream runs ~115 MB/s) or isn't reading at all.
+  `clear_halt` makes it resume cleanly at the next frame boundary. Chunked
+  host reads therefore tear frames; the reliable pattern is
+  `clear_halt(0x83)` → **one bulk transfer sized ≥ the whole wire frame**
+  (the end-of-frame short packet terminates it at exactly the wire size),
+  retrying on a pipe error. ST's driver likewise submits frame-sized URBs.
+
+From `vdx6gx_frame_decoding.py` + `image_sensor_python_sdk.py` (the
+**post-driver payload**, i.e. after §5.0 de-chunking):
 
 - The driver returns a contiguous payload (`get_raw_frame` gives an offset+size
   into a capture buffer sized `1024 + 2×max_frame_size`).
@@ -395,6 +435,29 @@ lot of the above against real hardware:
 
 A 25 MB USBPcap of a **cold** GUI launch (unplug → capture → GUI). Same channels
 as §8 (cmd-OUT `0x05`, answer-IN `0x85`, video-IN `0x83`, ~16.5 MB of frames).
+
+> ### ⚠ 9.0 Command semantics — ✅ hardware-confirmed 2026-07-16
+>
+> Driving the live sensor exposed two things the write-only extraction missed
+> (each cost a silent no-video failure until found):
+>
+> 1. **Command registers self-clear.** `0x0200`/`0x0201`/`0x0202` read back 0
+>    once the sensor has consumed the command. The GUI polls the register
+>    after every command write (e.g. `0x0201`←01 cleared after ~2 polls
+>    ≈ 25 ms); **issuing the next command while the previous is nonzero gets
+>    it silently dropped.** Implementations must write → poll-to-0
+>    (`Vd56g3.send_command` / `termux_grab.Console.send_command`).
+> 2. **ST's constant names have start/stop swapped.**
+>    `0x0201 ← 01` **STARTS** streaming (`SYSTEM_FSM` 2→3);
+>    `0x0202 ← 01` **STOPS** it (3→2). In the capture, `0x0201`←01 precedes
+>    all 242 streamed frames and the final `0x0202`←01 is the GUI's **Stop
+>    click at session end** — early extractions replayed it as the "last init
+>    step", stopping the stream immediately after starting it. The replay now
+>    ends at `0x0201`←01. (`0x0201 ← 04` also appears around init/stop; mode
+>    byte semantics unknown, replayed verbatim.)
+>
+> `SYSTEM_FSM` (0x0028): 1 = ready-to-boot, 2 = standby, 3 = streaming.
+
 The decisive results:
 
 - **No firmware patch.** Reads of `FWPATCH_REVISION` (0x1E) and `VTIMING_RD_REV`
@@ -416,12 +479,14 @@ The decisive results:
   5. Analog/clock: `0x0960<-1C`, `0x096A<-3C00`, **`EXT_CLOCK 0x0220 <- 12 MHz`**,
      `CLK_PLL_PREDIV 0x0224<-02`, `CLK_SYS_PLL_MULT 0x0226<-86`,
      `CLK_PLL_POSTDIV 0x0225<-01`, `VT_CLK_DIV 0x0227<-05`.
-  6. `CMD_STBY 0x0201<-04`; `ORIENTATION 0x0302<-02`; `CTX0_EXP_MODE 0x044C<-00`.
+  6. `0x0201<-04` (mode byte, see §9.0); `ORIENTATION 0x0302<-02`; `CTX0_EXP_MODE 0x044C<-00`.
   7. ROI/exposure (context 0): `Y_START 0x045A=0`, `Y_END 0x045C=1359`,
      `OUT_ROI_Y 0x0462=0 / 0x0464=1359`, `AE_ROI_V 0x0434=0 / 0x0438=1359`,
      `OUT_ROI_X 0x045E=2 / 0x0460=1121`, `FRAME_LENGTH 0x0458=2168`,
      `COARSE_EXPOSURE 0x044E=1000` (repeated a few times).
-  8. `CFG2WR` (bpp10) again; **`CMD_STBY 0x0201<-01`**; **`CMD_STREAMING 0x0202<-01`**.
+  8. `CFG2WR` (bpp10) again; **`CMD_START_STREAM 0x0201<-01`** → streaming
+     (FSM=3; all 242 captured frames follow). The capture's later
+     `0x0202<-01` is the session's **Stop** (§9.0) — excluded from the replay.
 
 - **Streamed geometry:** OUT_ROI X`[2..1121]` → **width 1120**, Y`[0..1359]` →
   **height 1360**, **RAW10** (final `CFG2WR` bpp = 10). Note the format register

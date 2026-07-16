@@ -63,10 +63,17 @@ export const STATUS_REG = Object.freeze({
 });
 
 // Sensor command / config registers touched by the init sequence (PROTOCOL.md
-// §6, mirrors firmware/vd56g3_registers.py).
+// §6/§9.0, mirrors firmware/vd56g3_registers.py).
+//
+// ⚠ Command semantics (HARDWARE-CONFIRMED 2026-07-16, contra ST's constant
+// names): command registers SELF-CLEAR to 0 when consumed (poll before the
+// next command or it is silently dropped), 0x0201<-01 STARTS streaming
+// (SYSTEM_FSM 2->3) and 0x0202<-01 STOPS it. See PROTOCOL.md §9.0.
 export const REG = Object.freeze({
-  CMD_BOOT:              0x0200, // u8  write 1 to boot after main patch load
-  CMD_STREAMING:         0x0202, // u8  1=start streaming, 0=stop
+  CMD_BOOT:              0x0200, // u8  write 1 to boot the sensor FW; self-clears
+  CMD_START_STREAM:      0x0201, // u8  write 1 to START streaming; self-clears
+  CMD_STOP_STREAM:       0x0202, // u8  write 1 to STOP streaming; self-clears
+  SYSTEM_FSM:            0x0028, // u8  1=ready-to-boot, 2=standby, 3=streaming
   CMD_DEBUG:             0x0203, // u8  1=enter patch mode, 2=exit (VT patch)
   STATICS_FORMAT_CTRL:   0x030A, // u16 bits per pixel (8 or 10)
   // STREAM_STATICS OUTPUT_CTRL. ST's vdx6gx_constants.py defines the symbol
@@ -254,6 +261,40 @@ export class Cx3Console {
       }
     }
   }
+
+  /**
+   * Read ONE complete on-wire frame in a SINGLE transfer (PROTOCOL.md §5.0,
+   * hardware-confirmed strategy). The CX3 stalls EP 0x83 when its DMA
+   * overflows — which it does within milliseconds whenever the host pauses
+   * between chunked reads (~115 MB/s stream) or isn't reading at all.
+   * clearHalt makes it resume at the NEXT FRAME BOUNDARY, so each attempt is:
+   * clearHalt -> one frame-sized(+slack) transferIn (the end-of-frame short
+   * packet terminates it at exactly the wire size) -> validate the first
+   * chunk header. Chunked host reads tear frames; do not use them.
+   * @param {number} wireTotal exact on-wire frame size (wireFrameSize(payload))
+   * @param {number} [tries]
+   * @returns {Promise<Uint8Array>} the wire frame, or throws after `tries`
+   */
+  async readFrame(wireTotal, tries = 8) {
+    const request = wireTotal + 65536;
+    let lastErr = "";
+    for (let attempt = 1; attempt <= tries; attempt++) {
+      try { await this.device.clearHalt("in", this.videoIn); } catch (_) { /* ignore */ }
+      let data;
+      try {
+        const rd = await this.device.transferIn(this.videoIn, request);
+        if (rd.status === "stall") throw new Error("stall");
+        data = new Uint8Array(rd.data.buffer, rd.data.byteOffset, rd.data.byteLength);
+      } catch (err) {
+        lastErr = err.message;
+        this.log(`! video attempt ${attempt}/${tries}: ${err.message}`);
+        continue;
+      }
+      if (data.length >= wireTotal && isFrameStart(data)) return data;
+      this.log(`! video attempt ${attempt}/${tries}: ${data.length} bytes, frameStart=${isFrameStart(data)} — retrying`);
+    }
+    throw new Error(`no complete frame after ${tries} attempts${lastErr ? ` (last: ${lastErr})` : ""}`);
+  }
 }
 
 // =============================================================================
@@ -398,11 +439,47 @@ export class Vd56g3 {
     return Math.round((2 * cfg.bpp * cfg.dataRateMbps * 1e6) / pclk) - 1_000_000;
   }
 
-  // ---- streaming control (PROTOCOL.md §6 steps 10/12) --------------------
-  /** Start streaming: sensor CMD_STREAMING <- 1. */
-  startStream() { return this.write8(REG.CMD_STREAMING, 1); }
-  /** Stop streaming: sensor CMD_STREAMING <- 0. */
-  stopStream()  { return this.write8(REG.CMD_STREAMING, 0); }
+  // ---- command handshake (PROTOCOL.md §9.0, hardware-confirmed) -----------
+  /**
+   * Write a self-clearing command register and poll it back to 0. Issuing the
+   * next command while the previous one is still nonzero gets it silently
+   * dropped (observed on hardware as SYSTEM_FSM stuck at 2 / no video).
+   * @returns {Promise<boolean>} true once the register reads 0
+   */
+  async sendCommand(reg, value, timeoutMs = 2000) {
+    await this.write8(reg, value);
+    const deadline = performance.now() + timeoutMs;
+    let last = -1;
+    while (performance.now() < deadline) {
+      try { last = await this.read8(reg); } catch (_) { last = -1; }
+      if (last === 0) return true;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    this.console.log(`! command 0x${reg.toString(16)} <- 0x${value.toString(16)} not consumed (reads ${last})`);
+    return false;
+  }
+
+  /** Poll SYSTEM_FSM (0x0028) until it reaches `target` (1 ready / 2 standby / 3 streaming). */
+  async waitFsm(target, timeoutMs = 3000, label = "") {
+    const deadline = performance.now() + timeoutMs;
+    let val = -1;
+    while (performance.now() < deadline) {
+      try { val = await this.read8(REG.SYSTEM_FSM); } catch (_) { val = -1; }
+      if (val === target) return val;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    this.console.log(`! SYSTEM_FSM=${val}, wanted ${target} ${label}`);
+    return val;
+  }
+
+  // ---- streaming control (PROTOCOL.md §9.0 — hardware-confirmed semantics) --
+  /** Start streaming: CMD_START_STREAM (0x0201) <- 1, then wait for FSM=3. */
+  async startStream() {
+    await this.sendCommand(REG.CMD_START_STREAM, 1);
+    return this.waitFsm(3, 5000, "(post-start)");
+  }
+  /** Stop streaming: CMD_STOP_STREAM (0x0202) <- 1 (FSM -> 2). */
+  stopStream()  { return this.sendCommand(REG.CMD_STOP_STREAM, 1); }
 }
 
 // =============================================================================
@@ -439,21 +516,48 @@ export async function replayColdInit(sensor, url) {
   const doc = url
     ? await (async () => { const r = await fetch(url); if (!r.ok) throw new Error(`cold-init fetch failed: HTTP ${r.status} (${url})`); return r.json(); })()
     : await fetchFirmwareJson("vd56g3_cold_init.json");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // The captured session ends with the GUI's Stop click (0x0202 <- 01), which
+  // older extractions kept as the "final init step" — replaying it stops the
+  // stream right after starting it (PROTOCOL.md §9.0). Skip any trailing stop.
+  const steps = doc.steps.slice();
+  while (steps.length && steps[steps.length - 1].op === "write"
+         && steps[steps.length - 1].reg === REG.CMD_STOP_STREAM) {
+    steps.pop();
+  }
+
+  const cmdRegs = new Set([REG.CMD_BOOT, REG.CMD_START_STREAM, REG.CMD_STOP_STREAM]);
   const writes = {};
   let bpp = 8;
-  for (const step of doc.steps) {
+  for (const step of steps) {
     if (step.op === "write") {
-      await sensor.writeRegBytes(step.reg, step.val);
       writes[step.reg] = step.val;
+      // Command registers need the self-clear handshake (PROTOCOL.md §9.0) —
+      // a back-to-back replay outruns the sensor and commands get dropped.
+      if (cmdRegs.has(step.reg) && step.val.length === 1) {
+        await sensor.sendCommand(step.reg, step.val[0]);
+        if (step.reg === REG.CMD_BOOT) {
+          await sensor.waitFsm(2, 2000, "(post-CMD_BOOT)");
+        } else if (step.reg === REG.CMD_START_STREAM && step.val[0] === 1) {
+          await sensor.waitFsm(3, 5000, "(post-CMD_START_STREAM)");
+        }
+      } else {
+        await sensor.writeRegBytes(step.reg, step.val);
+        await sleep(10);
+      }
     } else {
       const args = step.args || [];
       if (step.cmd === "CFG2WR" && args.length >= 11) bpp = args[10];
       await sensor.console.query(step.cmd, args);
+      // The GUI spaces the NRST reset toggles 76-494 ms apart.
+      await sleep(step.cmd === "NRST" ? 100 : 10);
     }
   }
   const u16 = (r) => { const b = writes[r]; return b && b.length >= 2 ? (b[0] | (b[1] << 8)) : 0; };
   const width = u16(REG.CTX0_OUT_ROI_X_END) - u16(REG.CTX0_OUT_ROI_X_START) + 1;
   const height = u16(REG.CTX0_OUT_ROI_Y_END) - u16(REG.CTX0_OUT_ROI_Y_START) + 1;
+  // The replay ends at CMD_START_STREAM <- 1: the sensor is STREAMING now.
   return { width, height, bpp };
 }
 
@@ -569,6 +673,57 @@ export async function loadMainPatch(sensor, url = "../firmware/vd56g3_main_patch
 }
 
 // =============================================================================
+// On-wire frame chunking (PROTOCOL.md §5.0 — hardware-confirmed 2026-07-16)
+// =============================================================================
+// The CX3 delivers each frame as 16384-byte chunks (final chunk short):
+//   [16-byte header][payload_len bytes][16-byte footer (absent on last chunk)]
+// header: magic 10 01 02 00 | u16 chunk idx (1-based) | u16 | u32 frame seq |
+//         u32 payload_len (0x3FE0 = 16352 for full chunks).
+// 1120x1360 RAW10 -> payload 1,906,800 B -> 117 chunks -> 1,910,528 B on wire.
+
+export const WIRE_MAGIC = Object.freeze([0x10, 0x01, 0x02, 0x00]);
+export const WIRE_CHUNK_STRIDE = 16384;
+export const WIRE_CHUNK_PAYLOAD = 16352;
+
+/** Total on-wire bytes for a frame whose post-driver payload is `payloadSize`. */
+export function wireFrameSize(payloadSize) {
+  const chunks = Math.ceil(payloadSize / WIRE_CHUNK_PAYLOAD);
+  return payloadSize + chunks * 16 + (chunks - 1) * 16;
+}
+
+/** True if `data` begins with a frame's FIRST chunk header (magic + chunk idx 1). */
+export function isFrameStart(data) {
+  return data.length >= 6
+    && data[0] === 0x10 && data[1] === 0x01 && data[2] === 0x02 && data[3] === 0x00
+    && data[4] === 0x01 && data[5] === 0x00;
+}
+
+/**
+ * Reassemble the post-driver frame payload from the CX3 wire chunking.
+ * Pass-through (frameSeq=null) if `raw` does not start with the chunk magic.
+ * @param {Uint8Array} raw
+ * @returns {{payload: Uint8Array, frameSeq: (number|null)}}
+ */
+export function stripWireChunks(raw) {
+  const isMagic = (o) => raw[o] === 0x10 && raw[o + 1] === 0x01 && raw[o + 2] === 0x02 && raw[o + 3] === 0x00;
+  if (raw.length < 16 || !isMagic(0)) return { payload: raw, frameSeq: null };
+  const out = new Uint8Array(raw.length); // upper bound; trimmed below
+  let filled = 0;
+  let frameSeq = null;
+  for (let off = 0; off + 16 <= raw.length; off += WIRE_CHUNK_STRIDE) {
+    if (!isMagic(off)) throw new Error(`wire chunk magic missing at offset ${off}`);
+    if (frameSeq === null) {
+      frameSeq = raw[off + 8] | (raw[off + 9] << 8) | (raw[off + 10] << 16) | (raw[off + 11] << 24);
+    }
+    const plen = raw[off + 12] | (raw[off + 13] << 8) | (raw[off + 14] << 16) | (raw[off + 15] << 24);
+    if (plen > WIRE_CHUNK_PAYLOAD) throw new Error(`chunk at ${off} declares payload ${plen}`);
+    out.set(raw.subarray(off + 16, off + 16 + plen), filled);
+    filled += plen;
+  }
+  return { payload: out.subarray(0, filled), frameSeq };
+}
+
+// =============================================================================
 // Frame decode (PROTOCOL.md §5, mirrors ST vdx6gx_frame_decoding.py exactly)
 // =============================================================================
 
@@ -636,7 +791,11 @@ export function decodeRaw10(img, rows, widthBytes) {
  *   maxValue:number
  * }}
  */
-export function decodeFrame(raw, width, bppHint = 8) {
+export function decodeFrame(rawWire, width, bppHint = 8) {
+  // De-chunk the CX3 wire framing first (PROTOCOL.md §5.0); pass-through for
+  // post-driver payloads (no magic).
+  const { payload: raw, frameSeq } = stripWireChunks(rawWire);
+
   // bits per pixel from the status line (must be 8 or 10). Fall back to hint if
   // the status line looks wrong (e.g. a truncated / not-yet-valid frame).
   let bpp = statusValue8(raw, STATUS_REG.FORMAT_CTRL, 0);
@@ -671,5 +830,5 @@ export function decodeFrame(raw, width, bppHint = 8) {
     maxValue = 255;
   }
 
-  return { width, height, bpp, frameCounter, currentContext, pixels, maxValue };
+  return { width, height, bpp, frameCounter, currentContext, pixels, maxValue, frameSeq };
 }
