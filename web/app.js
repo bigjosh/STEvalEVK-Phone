@@ -11,7 +11,7 @@
 import {
   Cx3Console, Vd56g3,
   replayColdInit, decodeFrame, wireFrameSize,
-} from "./protocol.js?v=16k"; // ?v= keeps protocol.js in lockstep with app.js
+} from "./protocol.js?v=16l"; // ?v= keeps protocol.js in lockstep with app.js
 
 // VID:PID of the EVK (PROTOCOL.md §1).
 const VENDOR_ID = 0x0553;
@@ -462,6 +462,7 @@ function renderFrame(frame) {
   ctx.putImageData(imgData, 0, 0);
 
   // Export a JPEG via canvas.toBlob and enable the download link.
+  // Quality 1.0 = minimal compression (biggest file, fewest artifacts).
   canvas.toBlob((blob) => {
     if (!blob) { log("toBlob returned null — JPEG export unavailable."); return; }
     const link = $("download");
@@ -469,16 +470,15 @@ function renderFrame(frame) {
     link.href = URL.createObjectURL(blob);
     link.download = `evk_frame_${frame.frameCounter}.jpg`;
     link.classList.remove("disabled");
-    link.textContent = `Download JPEG (${(blob.size / 1024).toFixed(1)} KB)`;
-    log(`JPEG ready (${blob.size} bytes).`);
-  }, "image/jpeg", 0.92);
+    link.textContent = `Download JPEG (${(blob.size / 1024).toFixed(1)} KB, q=1.0)`;
+    log(`JPEG ready (${blob.size} bytes, quality 1.0).`);
+  }, "image/jpeg", 1.0);
 }
 
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16k (manual exposure: bare pre-START writes — GPH release races " +
-  "START_STREAM; injection anchored to START_STREAM value, not the thermal reads)";
+const APP_BUILD = "2026-07-16l (JPEG export at quality 1.0 — minimal compression)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);
