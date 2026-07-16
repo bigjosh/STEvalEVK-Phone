@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STEVAL-EVK-U0I — WebUSB one-frame grab</title>
+  <!--
+    Phase-2 static WebUSB app (no build step, no external deps/CDNs).
+    Connects to the STEVAL-EVK-U0I (CX3 + VD56G3), replays the init-to-first-
+    frame sequence, pulls ONE frame, renders it, and exports a JPEG.
+    Mirrors the Phase-1 protocol (see PROTOCOL.md). WebUSB requires a secure
+    context (HTTPS) — works on GitHub Pages; use Chrome for Android.
+  -->
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      margin: 0; padding: 1rem; line-height: 1.4;
+      max-width: 720px; margin-inline: auto;
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+    p.sub { margin: 0 0 1rem; opacity: .75; font-size: .85rem; }
+    .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-bottom: .75rem; }
+    button {
+      font-size: 1rem; padding: .6rem 1rem; border-radius: .5rem;
+      border: 1px solid currentColor; background: transparent; cursor: pointer;
+    }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    #status {
+      font-size: .85rem; padding: .4rem .6rem; border-radius: .4rem;
+      background: rgba(128,128,128,.15); margin-bottom: .75rem;
+    }
+    fieldset { border: 1px solid rgba(128,128,128,.4); border-radius: .5rem; margin-bottom: .75rem; }
+    legend { font-size: .8rem; opacity: .8; padding: 0 .4rem; }
+    label { font-size: .8rem; display: inline-flex; flex-direction: column; gap: .2rem; }
+    input[type="number"] { width: 5rem; padding: .3rem; font-size: .9rem; }
+    canvas {
+      max-width: 100%; height: auto; border: 1px solid rgba(128,128,128,.4);
+      border-radius: .4rem; background: #222; display: block; margin-bottom: .5rem;
+      image-rendering: pixelated;
+    }
+    a#download { font-size: .9rem; }
+    a#download.disabled { pointer-events: none; opacity: .4; }
+    pre#log {
+      font-size: .72rem; line-height: 1.35; white-space: pre-wrap; word-break: break-word;
+      background: rgba(128,128,128,.12); padding: .6rem; border-radius: .5rem;
+      max-height: 40vh; overflow-y: auto; margin: 0;
+    }
+    .hint { font-size: .72rem; opacity: .7; }
+  </style>
+</head>
+<body>
+  <h1>STEVAL-EVK-U0I — WebUSB one-frame grab</h1>
+  <p class="sub">CX3 + VD56G3 · replays init → first frame · exports JPEG. Requires Chrome for Android over HTTPS.</p>
+
+  <div class="row">
+    <button id="connect">Connect</button>
+    <button id="capture" disabled>Capture frame</button>
+  </div>
+
+  <div id="status">Loading…</div>
+
+  <fieldset>
+    <legend>Options (endpoint addresses are needs-capture; blank = auto-discover)</legend>
+    <div class="row">
+      <label>cmd OUT ep<input type="number" id="epCmd" min="1" max="15" placeholder="auto"></label>
+      <label>answer IN ep<input type="number" id="epAns" min="1" max="15" placeholder="auto"></label>
+      <label>video IN ep<input type="number" id="epVideo" min="1" max="15" placeholder="auto"></label>
+      <label>bpp
+        <select id="bpp" style="padding:.3rem;font-size:.9rem;">
+          <option value="8" selected>8 (RAW8)</option>
+          <option value="10">10 (RAW10)</option>
+        </select>
+      </label>
+    </div>
+    <p class="hint">Leave endpoint fields blank to auto-discover from the interface descriptors (first bulk-OUT = command, small bulk-IN = answer, large bulk-IN = video).</p>
+  </fieldset>
+
+  <canvas id="preview" width="320" height="200"></canvas>
+  <div class="row">
+    <a id="download" class="disabled" href="#">Download JPEG</a>
+  </div>
+
+  <pre id="log"></pre>
+
+  <!-- ES modules; app.js imports protocol.js. No external scripts. -->
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

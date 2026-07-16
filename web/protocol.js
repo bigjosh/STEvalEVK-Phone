@@ -1,0 +1,660 @@
+// protocol.js — STEVAL-EVK-U0I (CX3 "spider" + VD56G3) WebUSB protocol layer
+// =============================================================================
+// A dependency-free ES module that mirrors the Phase-1 Python protocol BYTE FOR
+// BYTE. The authoritative spec is PROTOCOL.md in the repo root; section numbers
+// (§2, §3.1, §4, §5, §6) below refer to it. Everything here was derived by
+// static analysis of ST's STSW-IMG507 v2.1.0 binaries + shipped Python examples.
+//
+// Transport model (PROTOCOL.md §2):
+//   The CX3 firmware exposes a request/response ASCII console over a BULK
+//   endpoint pair. A request is one line:
+//       <KEYWORD>( <HH>)* \r\n
+//   i.e. the command mnemonic, then for EACH argument byte a single space
+//   followed by TWO UPPERCASE hex digits (high nibble first), terminated by
+//   CRLF (0x0D 0x0A). The reply arrives on the answer bulk-IN endpoint and is
+//   NUL-terminated by firmware.
+//
+// Sensor register access (PROTOCOL.md §3.1) is I2C tunnelled through the console:
+//   - register ADDRESS is 16-bit BIG-endian on the wire (addr_hi, addr_lo)
+//   - register VALUE   is LITTLE-endian, LSB first (1/2/4 bytes)
+//
+// NOTHING here hardcodes endpoint numbers as the only option — they are
+// auto-discovered from the interface descriptors and overridable (see app.js).
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Command index table (PROTOCOL.md §3). The *index* is 1-based table order; the
+// firmware keys on the KEYWORD string on the wire, but we keep the index for
+// documentation / parity with cx3_query(board, cmd_index, ...).
+// ---------------------------------------------------------------------------
+export const CMD = Object.freeze({
+  ID:        1,
+  VERSION:   2,
+  I2CWR:     3,
+  I2CRD:     4,
+  IOSET:     5,
+  IOGET:     6,
+  SPIWRRD:   7,
+  NRST:      8,
+  CFGWR:     9,
+  CFGRD:     10,
+  CLKWR:     11,
+  CLKRD:     12,
+  I2CWRRD:   13,
+  IOCFGWR:   14,
+  IOCFGRD:   15,
+  LOGLVLWR:  16,
+  LOGLVLRD:  17,
+  CFG2WR:    18,
+  CFG2RD:    19,
+  RESET:     20,
+});
+
+// Sensor I2C address as seen by the CX3 (8-bit base; 7-bit = 0x10). §1.
+export const SENSOR_I2C_ADDR = 0x20;
+
+// Status-line register addresses read back out of the frame (PROTOCOL.md §5,
+// mirrors ST vdx6gx_constants.py).
+export const STATUS_REG = Object.freeze({
+  FRAME_COUNTER:   0x50, // u16
+  CURRENT_CONTEXT: 0x56, // u8
+  FORMAT_CTRL:     0x5B, // u8  -> bits per pixel (8 or 10)
+  OUT_ROI_Y_SIZE:  0x94, // u16 -> y_size (image rows)
+});
+
+// Sensor command / config registers touched by the init sequence (PROTOCOL.md
+// §6, mirrors firmware/vd56g3_registers.py).
+export const REG = Object.freeze({
+  CMD_BOOT:              0x0200, // u8  write 1 to boot after main patch load
+  CMD_STREAMING:         0x0202, // u8  1=start streaming, 0=stop
+  CMD_DEBUG:             0x0203, // u8  1=enter patch mode, 2=exit (VT patch)
+  STATICS_FORMAT_CTRL:   0x030A, // u16 bits per pixel (8 or 10)
+  // STREAM_STATICS OUTPUT_CTRL. ST's vdx6gx_constants.py defines the symbol
+  // twice (0x0096 then 0x0335); `import *` makes 0x0335 win, so the example
+  // writes 0x0335. 0x0096 is the read-only status mirror. Do NOT change back.
+  STREAM_OUTPUT_CTRL:    0x0335, // u8 (written via write16 to mirror ST exactly)
+  CONTEXTS_READOUT_CTRL: 0x0474, // u8
+  CTX0_OUT_ROI_X_START:  0x045E, // u16
+  CTX0_OUT_ROI_X_END:    0x0460, // u16
+  CTX0_OUT_ROI_Y_START:  0x0462, // u16
+  CTX0_OUT_ROI_Y_END:    0x0464, // u16
+});
+
+// Known-good defaults (PROTOCOL.md §4/§6, firmware/vd56g3_registers.py DEFAULT).
+// bpp defaults to 8 (RAW8) — "use RAW8 first on the phone".
+export const DEFAULTS = Object.freeze({
+  bpp: 8,
+  // Sensor ROI (context 0) register values:
+  x_start: 2, x_end: 1105,     // active width 1104
+  y_start: 2, y_end: 1361,     // active height 1360
+  // CX3 CSI receiver (CFGWR) params:
+  csi_lanes: 2,
+  csi_field_b: 0,              // VC / format selector (byte 1)
+  csi_data_rate_mbps: 1500,
+  csi_width: 1116,            // width on the wire (incl. ROI + status budget)
+  csi_height: 1356,          // height on the wire
+  csi_pixel_clock_hz: 160_800_000, // only consumed by the CFG2WR (v2) path
+  csi_field11: 0,            // byte 11 reserved/format
+});
+
+// CFG2WR (v2 CSI config) payloads captured VERBATIM from real hardware
+// (captures/steval-connect). The device uses CFG2WR, not the derived CFGWR
+// struct — replay these 12 bytes for the matching bpp. Mirrors
+// firmware/vd56g3_csi_cfg2wr.json and reg.CFG2WR_CAPTURED (Python).
+export const CFG2WR_CAPTURED = Object.freeze({
+  8:  [0x26, 0x02, 0x04, 0xBB, 0x8C, 0x40, 0x04, 0x00, 0x04, 0x00, 0x08, 0x64],
+  10: [0x26, 0x02, 0x05, 0xEE, 0x3F, 0xE0, 0x04, 0x00, 0x04, 0x00, 0x0A, 0x64],
+});
+
+// Bulk transfer timeout in ms (PROTOCOL.md §2 — 150 ms).
+export const BULK_TIMEOUT_MS = 150;
+
+// =============================================================================
+// Small byte helpers
+// =============================================================================
+const HEX = [];
+for (let i = 0; i < 256; i++) HEX[i] = i.toString(16).toUpperCase().padStart(2, "0");
+
+/**
+ * Build the ASCII request line for the console (PROTOCOL.md §2).
+ *   keyword + (" " + HH)* + CRLF
+ * @param {string} keyword command mnemonic, e.g. "I2CWR"
+ * @param {Uint8Array|number[]} args argument bytes
+ * @returns {Uint8Array} bytes ready for transferOut (CRLF included, no NUL)
+ */
+export function buildRequest(keyword, args = []) {
+  let line = keyword;
+  for (const b of args) {
+    // Each argument byte: one space + two uppercase hex digits, MSB nibble first.
+    line += " " + HEX[b & 0xff];
+  }
+  line += "\r\n"; // CRLF terminator (0x0D 0x0A). NUL is not sent on the wire.
+  // ASCII-only, so a plain char->byte map is exact.
+  const out = new Uint8Array(line.length);
+  for (let i = 0; i < line.length; i++) out[i] = line.charCodeAt(i) & 0xff;
+  return out;
+}
+
+/**
+ * Decode a NUL-terminated console reply into text (PROTOCOL.md §2).
+ * @param {Uint8Array} bytes raw bytes read from the answer bulk-IN endpoint
+ * @returns {string} the ASCII text up to (not including) the first NUL
+ */
+export function decodeReply(bytes) {
+  let end = bytes.length;
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] === 0x00) { end = i; break; }
+  }
+  let s = "";
+  for (let i = 0; i < end; i++) s += String.fromCharCode(bytes[i]);
+  return s;
+}
+
+/**
+ * Parse the hex data bytes out of a console reply.
+ * Grammar is [capture-confirmed] (PROTOCOL.md §8): "OK <HH> <HH> ...". We drop
+ * the leading OK status token and parse the space-separated hex bytes. Returns
+ * [] if nothing parses.
+ * @param {string} reply
+ * @returns {number[]} bytes
+ */
+export function parseHexBytes(reply) {
+  const out = [];
+  let toks = reply.replace(/,/g, " ").trim().split(/\s+/);
+  if (toks.length && toks[0].toUpperCase() === "OK") toks = toks.slice(1);
+  for (const t of toks) {
+    const m = /^(0x)?([0-9a-fA-F]{1,2})$/.exec(t);
+    if (m) out.push(parseInt(m[2], 16));
+  }
+  return out;
+}
+
+// =============================================================================
+// Cx3Console — the ASCII request/response transport over a WebUSB USBDevice
+// =============================================================================
+export class Cx3Console {
+  /**
+   * @param {USBDevice} device an opened WebUSB device with its interface claimed
+   * @param {object} eps endpoint numbers { cmdOut, ansIn, videoIn }
+   * @param {(msg:string)=>void} [log] optional transaction logger
+   */
+  constructor(device, eps, log = () => {}) {
+    this.device = device;
+    this.cmdOut = eps.cmdOut;   // command OUT (console request)   — PROTOCOL.md §1
+    this.ansIn = eps.ansIn;     // answer  IN (console reply)
+    this.videoIn = eps.videoIn; // video   IN (streaming payload)
+    this.log = log;
+    // answer read buffer capacity (firmware reply is small ASCII; be generous)
+    this.answerCap = 4096;
+  }
+
+  /**
+   * One console transaction: write request, read the NUL-terminated reply.
+   * Mirrors cx3_query (PROTOCOL.md §2): on a failed transfer, clear_halt the
+   * answer-IN endpoint and retry ONCE.
+   * @param {string} keyword
+   * @param {Uint8Array|number[]} [args]
+   * @returns {Promise<{text:string,bytes:Uint8Array}>}
+   */
+  async query(keyword, args = []) {
+    const req = buildRequest(keyword, args);
+    this.log(`> ${keyword}${args.length ? " " + Array.from(args, (b) => HEX[b & 0xff]).join(" ") : ""}`);
+
+    let attempt = 0;
+    // Retry loop: at most one retry (2 attempts total) per PROTOCOL.md §2.
+    for (;;) {
+      try {
+        // ---- write request on the command bulk-OUT endpoint ----
+        const wr = await this.device.transferOut(this.cmdOut, req);
+        if (wr.status !== "ok") throw new Error(`transferOut status=${wr.status}`);
+
+        // ---- read the reply on the answer bulk-IN endpoint ----
+        const rd = await this._readAnswer();
+        const text = decodeReply(rd);
+        this.log(`< ${text.replace(/\r?\n/g, " ").trim() || "(empty)"}`);
+        return { text, bytes: rd };
+      } catch (err) {
+        attempt++;
+        if (attempt >= 2) {
+          this.log(`! ${keyword} failed: ${err.message}`);
+          throw err;
+        }
+        // Recovery: clear a stalled answer-IN endpoint, then retry once.
+        this.log(`! ${keyword} transfer error (${err.message}); clearHalt + retry`);
+        try { await this.device.clearHalt("in", this.ansIn); } catch (_) { /* ignore */ }
+      }
+    }
+  }
+
+  /** Read one NUL-terminated answer packet from the answer bulk-IN endpoint. */
+  async _readAnswer() {
+    const rd = await this.device.transferIn(this.ansIn, this.answerCap);
+    if (rd.status !== "ok") throw new Error(`transferIn status=${rd.status}`);
+    return new Uint8Array(rd.data.buffer, rd.data.byteOffset, rd.data.byteLength);
+  }
+
+  /**
+   * Read up to `length` bytes off the VIDEO bulk-IN endpoint (a single transfer).
+   * The higher-level frame assembler loops over this. clearHalt+retry once on stall.
+   * @param {number} length bytes to request
+   * @returns {Promise<Uint8Array>}
+   */
+  async readVideo(length) {
+    let attempt = 0;
+    for (;;) {
+      try {
+        const rd = await this.device.transferIn(this.videoIn, length);
+        if (rd.status === "stall") throw new Error("video stall");
+        // "babble" or "ok" both carry data; surface whatever we got.
+        return new Uint8Array(rd.data.buffer, rd.data.byteOffset, rd.data.byteLength);
+      } catch (err) {
+        attempt++;
+        if (attempt >= 2) throw err;
+        try { await this.device.clearHalt("in", this.videoIn); } catch (_) { /* ignore */ }
+      }
+    }
+  }
+}
+
+// =============================================================================
+// Vd56g3 — sensor register / stream helpers layered on the console (PROTOCOL.md §3.1)
+// =============================================================================
+export class Vd56g3 {
+  /**
+   * @param {Cx3Console} console
+   * @param {number} [i2cAddr] sensor I2C address (8-bit base 0x20)
+   */
+  constructor(console, i2cAddr = SENSOR_I2C_ADDR) {
+    this.console = console;
+    this.i2c = i2cAddr & 0xff;
+  }
+
+  // ---- register WRITE (PROTOCOL.md §3.1 / §8) ----------------------------
+  // [capture-confirmed] writes go via I2CWRRD with read-length 0:
+  //   [rdlen_hi=0, rdlen_lo=0, i2c, reg_hi, reg_lo, value_bytes(LE)...]
+  //   register ADDRESS: 16-bit big-endian (reg_hi, reg_lo)
+  //   register VALUE:   little-endian, LSB first; reply is a bare "OK"
+  async _writeReg(reg, valueBytes) {
+    const args = new Uint8Array(5 + valueBytes.length);
+    args[0] = 0; args[1] = 0;    // rdlen = 0 -> write, read nothing
+    args[2] = this.i2c;
+    args[3] = (reg >> 8) & 0xff; // reg_hi (big-endian address)
+    args[4] = reg & 0xff;        // reg_lo
+    args.set(valueBytes, 5);
+    return this.console.query("I2CWRRD", args);
+  }
+
+  /** Write raw (little-endian) value bytes to a register (used by the replay). */
+  writeRegBytes(reg, valueBytes) {
+    return this._writeReg(reg, valueBytes);
+  }
+
+  /** Write an 8-bit register value. */
+  write8(reg, val) {
+    return this._writeReg(reg, [val & 0xff]);
+  }
+
+  /** Write a 16-bit register value, LSB first. */
+  write16(reg, val) {
+    return this._writeReg(reg, [val & 0xff, (val >> 8) & 0xff]);
+  }
+
+  /** Write a 32-bit register value, LSB first. */
+  write32(reg, val) {
+    return this._writeReg(reg, [
+      val & 0xff,
+      (val >>> 8) & 0xff,
+      (val >>> 16) & 0xff,
+      (val >>> 24) & 0xff,
+    ]);
+  }
+
+  // ---- register READ (PROTOCOL.md §3.1) ----------------------------------
+  // I2CWRRD argument bytes = [rdlen_hi, rdlen_lo, i2c_addr, reg_hi, reg_lo]
+  //   rdlen: number of bytes to read (16-bit big-endian)
+  //   reply payload: rdlen bytes, reassembled little-endian.
+  async _readReg(reg, n) {
+    const args = new Uint8Array([
+      (n >> 8) & 0xff, // rdlen_hi
+      n & 0xff,        // rdlen_lo
+      this.i2c,
+      (reg >> 8) & 0xff, // reg_hi (big-endian address)
+      reg & 0xff,        // reg_lo
+    ]);
+    const { text } = await this.console.query("I2CWRRD", args);
+    // Reply grammar is [needs-capture]; parse a hex byte list, reassemble LE.
+    const bytes = parseHexBytes(text);
+    let value = 0;
+    for (let i = 0; i < n && i < bytes.length; i++) value |= bytes[i] << (8 * i);
+    return { value: value >>> 0, bytes };
+  }
+
+  async read8(reg)  { return (await this._readReg(reg, 1)).value; }
+  async read16(reg) { return (await this._readReg(reg, 2)).value; }
+  async read32(reg) { return (await this._readReg(reg, 4)).value >>> 0; }
+
+  // ---- CSI receiver config (PROTOCOL.md §4) ------------------------------
+  /**
+   * Build + send the 12-byte CFGWR payload configuring the CX3 CSI-2 receiver.
+   * Byte layout (PROTOCOL.md §4):
+   *   [0]    lane_number (u8)
+   *   [1]    field B     (u8)  VC/format selector
+   *   [2..5] data_rate_mbps (u32 BIG-endian)
+   *   [6..7] width  (u16 BIG-endian)
+   *   [8..9] height (u16 BIG-endian)
+   *   [10]   bit_per_pixel (u8)
+   *   [11]   field (u8) reserved/format
+   * @param {object} cfg { lanes, fieldB, dataRateMbps, width, height, bpp, field11 }
+   * @param {boolean} [useV2] send CFG2WR (index 18) instead of CFGWR (index 9)
+   * @param {boolean} [preferCaptured] default true: replay the exact CFG2WR bytes
+   *   captured from real hardware for cfg.bpp (the device uses CFG2WR). Set false
+   *   to use the computed path.
+   */
+  configureCsi(cfg, useV2 = false, preferCaptured = true) {
+    // Preferred: replay the verbatim CFG2WR bytes ST's GUI sent on real hardware.
+    if (preferCaptured && CFG2WR_CAPTURED[cfg.bpp]) {
+      return this.console.query("CFG2WR", CFG2WR_CAPTURED[cfg.bpp]);
+    }
+    const p = new Uint8Array(12);
+    p[0] = cfg.lanes & 0xff;
+    p[1] = cfg.fieldB & 0xff;
+    // data_rate_mbps as u32 big-endian
+    p[2] = (cfg.dataRateMbps >>> 24) & 0xff;
+    p[3] = (cfg.dataRateMbps >>> 16) & 0xff;
+    p[4] = (cfg.dataRateMbps >>> 8) & 0xff;
+    p[5] = cfg.dataRateMbps & 0xff;
+    // width u16 big-endian
+    p[6] = (cfg.width >> 8) & 0xff;
+    p[7] = cfg.width & 0xff;
+    // height u16 big-endian
+    p[8] = (cfg.height >> 8) & 0xff;
+    p[9] = cfg.height & 0xff;
+    p[10] = cfg.bpp & 0xff;
+    p[11] = cfg.field11 & 0xff;
+
+    if (useV2) {
+      // CFG2WR (v2) appends a derived timing word computed from pixel_clock:
+      //   round(2*bpp*data_rate*1e6 / pixel_clock) - 1000000
+      // The exact math is [needs-capture] (PROTOCOL.md §4) — this is a STUB that
+      // sends the same 12 bytes plus a best-effort timing u32 (big-endian).
+      // Default path stays CFGWR until a capture confirms the v2 word.
+      const timing = this._cfg2Timing(cfg) >>> 0;
+      const p2 = new Uint8Array(16);
+      p2.set(p, 0);
+      p2[12] = (timing >>> 24) & 0xff;
+      p2[13] = (timing >>> 16) & 0xff;
+      p2[14] = (timing >>> 8) & 0xff;
+      p2[15] = timing & 0xff;
+      return this.console.query("CFG2WR", p2);
+    }
+    return this.console.query("CFGWR", p);
+  }
+
+  /** [needs-capture] best-effort CFG2WR timing word (PROTOCOL.md §4). */
+  _cfg2Timing(cfg) {
+    const pclk = cfg.pixelClockHz || DEFAULTS.csi_pixel_clock_hz;
+    // Guarded so a zero pixel clock cannot divide-by-zero.
+    if (!pclk) return 0;
+    return Math.round((2 * cfg.bpp * cfg.dataRateMbps * 1e6) / pclk) - 1_000_000;
+  }
+
+  // ---- streaming control (PROTOCOL.md §6 steps 10/12) --------------------
+  /** Start streaming: sensor CMD_STREAMING <- 1. */
+  startStream() { return this.write8(REG.CMD_STREAMING, 1); }
+  /** Stop streaming: sensor CMD_STREAMING <- 0. */
+  stopStream()  { return this.write8(REG.CMD_STREAMING, 0); }
+}
+
+// =============================================================================
+// Cold-init replay (PROTOCOL.md §9) — the hardware-proven path
+// =============================================================================
+
+/**
+ * Replay the hardware-captured cold-init sequence verbatim from
+ * firmware/vd56g3_cold_init.json. This is what ST's GUI actually sent to a cold,
+ * UNPATCHED VD56G3 that then streamed: register writes (I2CWRRD rdlen=0) plus
+ * CLKWR/CFG2WR/NRST/IOSET/IOCFGWR, ending at CMD_STREAMING<-1. No FW patch is
+ * applied (the sensor streams without one). Returns {width, height, bpp} derived
+ * from the replayed OUT_ROI writes and the final CFG2WR bpp field.
+ * @param {Vd56g3} sensor
+ * @param {string} [url]
+ * @returns {Promise<{width:number,height:number,bpp:number}>}
+ */
+export async function replayColdInit(sensor, url = "../firmware/vd56g3_cold_init.json") {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`cold-init fetch failed: HTTP ${resp.status} (${url})`);
+  const doc = await resp.json();
+  const writes = {};
+  let bpp = 8;
+  for (const step of doc.steps) {
+    if (step.op === "write") {
+      await sensor.writeRegBytes(step.reg, step.val);
+      writes[step.reg] = step.val;
+    } else {
+      const args = step.args || [];
+      if (step.cmd === "CFG2WR" && args.length >= 11) bpp = args[10];
+      await sensor.console.query(step.cmd, args);
+    }
+  }
+  const u16 = (r) => { const b = writes[r]; return b && b.length >= 2 ? (b[0] | (b[1] << 8)) : 0; };
+  const width = u16(REG.CTX0_OUT_ROI_X_END) - u16(REG.CTX0_OUT_ROI_X_START) + 1;
+  const height = u16(REG.CTX0_OUT_ROI_Y_END) - u16(REG.CTX0_OUT_ROI_Y_START) + 1;
+  return { width, height, bpp };
+}
+
+// =============================================================================
+// Patch helpers (OPTIONAL — the sensor streams unpatched; kept for completeness)
+// =============================================================================
+
+/**
+ * Apply the VT (vertical-timing) patch (PROTOCOL.md §6 step 7).
+ * Fetches firmware/vd56g3_vt_patch.json (configurable URL) and replays:
+ *   Write8(enter_patch_mode.reg, enter_patch_mode.value)   // 0x0203 <- 1
+ *   for each { reg, val } in writes: Write8(reg, val)      // 3920 frames
+ *   Write8(exit_patch_mode.reg, exit_patch_mode.value)     // 0x0203 <- 2
+ * NOTE: the JSON stores reg/val as DECIMAL integers (e.g. enter reg 515 = 0x0203).
+ * Addresses are non-contiguous, hence per-register writes (not a burst).
+ * @param {Vd56g3} sensor
+ * @param {string} [url] path to the VT patch JSON
+ * @param {(done:number,total:number)=>void} [onProgress]
+ * @returns {Promise<number>} number of register writes applied
+ */
+export async function loadVtPatch(sensor, url = "../firmware/vd56g3_vt_patch.json", onProgress) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`VT patch fetch failed: HTTP ${resp.status} (${url})`);
+  const patch = await resp.json();
+  const enter = patch.enter_patch_mode;
+  const exit = patch.exit_patch_mode;
+  const writes = patch.writes || [];
+
+  // enter patch mode
+  await sensor.write8(enter.reg, enter.value);
+  // replay every write (Write8 — values are single bytes in this patch)
+  for (let i = 0; i < writes.length; i++) {
+    await sensor.write8(writes[i].reg, writes[i].val);
+    if (onProgress && (i % 200 === 0 || i === writes.length - 1)) {
+      onProgress(i + 1, writes.length);
+    }
+  }
+  // exit patch mode
+  await sensor.write8(exit.reg, exit.value);
+  return writes.length;
+}
+
+/**
+ * Apply the MAIN firmware patch (PROTOCOL.md §6 step 6 — THE documented blocker).
+ * If firmware/vd56g3_main_patch.bin exists: stream its bytes to the sensor, then
+ * Write8(0x0200, 1) (CMD_BOOT). If ABSENT: print a clear warning and continue in
+ * "warm-sensor mode" (assume the sensor is already patched, like ST init_board) —
+ * do NOT crash. This is the clean, well-labelled plug-in seam.
+ *
+ * The exact patch-RAM write transaction is [needs-capture]; the bytes are streamed
+ * as chunked I2CWR bursts to the patch region. `chunk` bounds each I2CWR payload.
+ *
+ * @param {Vd56g3} sensor
+ * @param {string} [url] path to the main patch blob
+ * @param {(msg:string)=>void} [log]
+ * @param {object} [opts] { baseReg=0x2000, chunk=250 }
+ * @returns {Promise<{applied:boolean, bytes:number}>}
+ */
+export async function loadMainPatch(sensor, url = "../firmware/vd56g3_main_patch.bin", log = () => {}, opts = {}) {
+  const baseReg = opts.baseReg ?? 0x2000; // patch RAM base region (PROTOCOL.md §6)
+  const chunk = opts.chunk ?? 250;         // I2CWR burst payload bound
+
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch (err) {
+    resp = null;
+  }
+
+  if (!resp || !resp.ok) {
+    // ---- WARM-SENSOR MODE (fallback) --------------------------------------
+    log(
+      "WARNING: main FW patch (" + url + ") not found — continuing in " +
+      "WARM-SENSOR MODE. This assumes the sensor is already patched/booted " +
+      "(as ST init_board does). A cold-powered sensor will NOT stream. See " +
+      "PROTOCOL.md §6 step 6 / STATE.md blocker."
+    );
+    return { applied: false, bytes: 0 };
+  }
+
+  // ---- COLD PATCH PATH (plug-in point) ------------------------------------
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  // Fail loudly rather than silently wrapping the 16-bit register address. NOTE:
+  // ST's load_binary uses a 64-bit register address, so patch RAM may not live
+  // in 16-bit I2C space at all — the addressing is NEEDS-CAPTURE.
+  if (baseReg + buf.length > 0x10000) {
+    throw new Error(
+      `main patch (${buf.length} bytes) from base 0x${baseReg.toString(16)} overruns ` +
+      `the 16-bit I2C register window (0x10000). Patch-RAM addressing is ` +
+      `needs-capture — pin it from a USBPcap capture before enabling this path.`
+    );
+  }
+  log(`Main FW patch found (${buf.length} bytes) — streaming to patch RAM @0x${baseReg.toString(16)}...`);
+  // Stream as chunked I2CWR bursts. Exact addressing is [needs-capture]; we write
+  // sequential 16-bit patch-RAM offsets from baseReg. Adjust here once a capture
+  // pins the real transaction down.
+  let off = 0;
+  while (off < buf.length) {
+    const n = Math.min(chunk, buf.length - off);
+    const reg = (baseReg + off) & 0xffff;
+    const args = new Uint8Array(3 + n);
+    args[0] = sensor.i2c;
+    args[1] = (reg >> 8) & 0xff; // reg_hi (big-endian address)
+    args[2] = reg & 0xff;        // reg_lo
+    args.set(buf.subarray(off, off + n), 3);
+    await sensor.console.query("I2CWR", args);
+    off += n;
+  }
+  // Boot the sensor after the patch load.
+  await sensor.write8(REG.CMD_BOOT, 1); // CMD_BOOT 0x0200 <- 1
+  log(`Main FW patch streamed (${buf.length} bytes) + CMD_BOOT issued.`);
+  return { applied: true, bytes: buf.length };
+}
+
+// =============================================================================
+// Frame decode (PROTOCOL.md §5, mirrors ST vdx6gx_frame_decoding.py exactly)
+// =============================================================================
+
+/**
+ * Extract an 8-bit status-line register value from a raw frame (PROTOCOL.md §5).
+ *   R <  0x7d : line 1, offset 2*R + 6
+ *   R >= 0x7d : line 2, offset frame_width_bytes + 2*(R-0x7d) + 6
+ * @param {Uint8Array} raw raw frame bytes
+ * @param {number} reg status register address
+ * @param {number} widthBytes frame width in bytes (bpp*width/8), needed for line 2
+ */
+export function statusValue8(raw, reg, widthBytes) {
+  const off = reg < 0x7d
+    ? 2 * reg + 6
+    : widthBytes + 2 * (reg - 0x7d) + 6;
+  return raw[off];
+}
+
+/** 16-bit status value (LSB-first), spanning consecutive register slots. */
+export function statusValue16(raw, reg, widthBytes) {
+  const lo = statusValue8(raw, reg, widthBytes);
+  const hi = statusValue8(raw, reg + 1, widthBytes);
+  return lo + 256 * hi;
+}
+
+/**
+ * Unpack ST RAW10 packing (PROTOCOL.md §5, ST decode_raw_10): every 5 bytes
+ * encode 4 pixels. bytes 0-3 are the high 8 bits of px0-3; byte 4 holds the
+ * four pairs of low 2 bits: px_i = (byte_i << 2) | ((byte4 >> (2*i)) & 3).
+ * Returns a Uint16Array of 10-bit pixels for `rows` rows of `widthBytes` bytes.
+ * @param {Uint8Array} img image buffer (status lines already stripped)
+ * @param {number} rows number of rows (y_size)
+ * @param {number} widthBytes bytes per row (bpp*width/8, bpp=10)
+ * @returns {Uint16Array}
+ */
+export function decodeRaw10(img, rows, widthBytes) {
+  const pxPerRow = (widthBytes / 5) * 4; // 5 bytes -> 4 px
+  const out = new Uint16Array(rows * pxPerRow);
+  let o = 0;
+  for (let r = 0; r < rows; r++) {
+    const base = r * widthBytes;
+    for (let b = 0; b + 4 < widthBytes; b += 5) {
+      const i = base + b;
+      const b0 = img[i], b1 = img[i + 1], b2 = img[i + 2], b3 = img[i + 3], b4 = img[i + 4];
+      out[o++] = (b0 << 2) | ((b4 >> 0) & 0x03);
+      out[o++] = (b1 << 2) | ((b4 >> 2) & 0x03);
+      out[o++] = (b2 << 2) | ((b4 >> 4) & 0x03);
+      out[o++] = (b3 << 2) | ((b4 >> 6) & 0x03);
+    }
+  }
+  return out;
+}
+
+/**
+ * Decode one raw frame (PROTOCOL.md §5, mirrors ST decode_frame).
+ * Strips the 2 status lines, reads bpp from status reg 0x5B and y_size from
+ * 0x94, then RAW8 = passthrough / RAW10 = 5->4 unpack.
+ * @param {Uint8Array} raw the full raw frame payload from the video bulk-IN
+ * @param {number} width image width in pixels (the CFG width used for framing)
+ * @param {number} [bppHint] fallback bpp if the status line is unreadable
+ * @returns {{
+ *   width:number, height:number, bpp:number,
+ *   frameCounter:number, currentContext:number,
+ *   pixels:(Uint8Array|Uint16Array), // grayscale samples, row-major
+ *   maxValue:number
+ * }}
+ */
+export function decodeFrame(raw, width, bppHint = 8) {
+  // bits per pixel from the status line (must be 8 or 10). Fall back to hint if
+  // the status line looks wrong (e.g. a truncated / not-yet-valid frame).
+  let bpp = statusValue8(raw, STATUS_REG.FORMAT_CTRL, 0);
+  if (bpp !== 8 && bpp !== 10) bpp = bppHint;
+
+  const widthBytes = Math.floor((bpp * width) / 8);
+
+  // CX3 4-byte packing constraint (PROTOCOL.md §5): width*bpp % 32 === 0.
+  if ((width * bpp) % 32 !== 0) {
+    throw new Error(
+      `frame width ${width} invalid for ${bpp}bpp: width*bpp must be a ` +
+      `multiple of 32 (CX3 4-byte packing constraint).`
+    );
+  }
+
+  // y_size, frame counter, context from the status lines (LSB-first).
+  const height = statusValue16(raw, STATUS_REG.OUT_ROI_Y_SIZE, widthBytes);
+  const frameCounter = statusValue16(raw, STATUS_REG.FRAME_COUNTER, widthBytes);
+  const currentContext = statusValue8(raw, STATUS_REG.CURRENT_CONTEXT, widthBytes);
+
+  // Image data begins after the 2 status lines.
+  const imgStart = 2 * widthBytes;
+  const imgBytes = raw.subarray(imgStart, imgStart + height * widthBytes);
+
+  let pixels, maxValue;
+  if (bpp === 10) {
+    pixels = decodeRaw10(imgBytes, height, widthBytes);
+    maxValue = 1023;
+  } else {
+    // RAW8: 1 byte per pixel, passthrough (copy so callers own the buffer).
+    pixels = new Uint8Array(imgBytes);
+    maxValue = 255;
+  }
+
+  return { width, height, bpp, frameCounter, currentContext, pixels, maxValue };
+}

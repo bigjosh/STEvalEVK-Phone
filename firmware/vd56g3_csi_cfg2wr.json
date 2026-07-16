@@ -1,0 +1,9 @@
+{
+  "_comment": "Exact CFG2WR (CX3 CSI-2 receiver config, v2) payloads captured from ST's GUI on real hardware (captures/steval-connect). The device uses CFG2WR, NOT CFGWR. Replay these 12 bytes verbatim for the matching bpp. Partial field decode: byte[1]=lanes(2), byte[10]=bits_per_pixel, byte[2..5]=bpp-scaled timing/clock word (u32 BE), byte[0]=0x26 and byte[6..9]=0x04000400 and byte[11]=0x64 are constant across the samples. Full field semantics are still being decoded; verbatim replay is the safe path.",
+  "command": "CFG2WR",
+  "source": "captures/steval-connect (warm sensor)",
+  "payloads": {
+    "8":  [38, 2, 4, 187, 140, 64, 4, 0, 4, 0, 8, 100],
+    "10": [38, 2, 5, 238, 63, 224, 4, 0, 4, 0, 10, 100]
+  }
+}

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Large local artifacts — raw USBPcap evidence + decoded dumps. Kept locally;
+# described in PROTOCOL.md §8-9 and reproducible via tools/, but too big/binary
+# (tens of MB) to track. The committed derived artifacts live in firmware/.
+captures/*
+!captures/README.md
+
+# The main FW patch blob (once captured) — large binary, drop it in but don't
+# necessarily commit it.
+firmware/vd56g3_main_patch.bin

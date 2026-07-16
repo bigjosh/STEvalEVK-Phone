@@ -1,0 +1,41 @@
+name: ci
+
+# Phase-1/2 has no hardware in CI, so we verify what can be checked offline:
+# Python compiles + the byte-level protocol regression tests (usb is stubbed),
+# and the WebUSB JS parses. This is the "buildable/testable from mobile" gate.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Byte-compile
+        run: python -m py_compile evk/*.py grab.py firmware/vd56g3_registers.py tools/*.py
+      - name: Offline protocol regression tests
+        run: python tests/test_protocol_offline.py
+      - name: Re-extract VT patch is a no-op vs committed JSON (skipped without SDK)
+        run: echo "VT patch extraction needs ST's .so (not in CI); committed JSON is the source of truth."
+
+  webusb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Syntax-check WebUSB modules
+        run: |
+          node --check web/protocol.js
+          node --check web/app.js

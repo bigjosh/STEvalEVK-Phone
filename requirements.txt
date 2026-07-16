@@ -1,0 +1,14 @@
+# Phase-1 pure-Python host (Termux/pyusb) dependencies.
+#
+# On Termux the libusb *native* library must be installed first, separately from
+# the Python binding:
+#     pkg install python libusb
+#     pip install -r requirements.txt
+# pyusb needs a libusb-1.0 backend (>= 1.0.16 for libusb_wrap_sys_device, which
+# the Termux fd-adoption path in evk/usb_termux.py requires). `pkg install
+# libusb` provides it. Stock pyusb enumeration does NOT work under Android — the
+# fd path (`termux-usb -e`) is mandatory there.
+
+pyusb>=1.2.1
+numpy>=1.21
+pillow>=9.0

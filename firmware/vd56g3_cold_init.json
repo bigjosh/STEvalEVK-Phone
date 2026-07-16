@@ -1,0 +1,686 @@
+{
+ "source": "captures/cold",
+ "note": "verbatim cold-init replay to CMD_STREAMING<-1; sensor streams UNPATCHED (FWPATCH_REVISION read 0 throughout). Writes are I2CWRRD rdlen=0.",
+ "steps": [
+  {
+   "op": "cmd",
+   "cmd": "ID",
+   "args": []
+  },
+  {
+   "op": "cmd",
+   "cmd": "VERSION",
+   "args": []
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "CLKWR",
+   "args": [
+    2,
+    0,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "CFG2WR",
+   "args": [
+    38,
+    2,
+    4,
+    187,
+    140,
+    64,
+    4,
+    0,
+    4,
+    0,
+    8,
+    100
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "NRST",
+   "args": [
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "CFG2WR",
+   "args": [
+    38,
+    2,
+    5,
+    238,
+    63,
+    224,
+    4,
+    0,
+    4,
+    0,
+    10,
+    100
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    17,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    18,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    19,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    20,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    21,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    22,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    23,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    24,
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    25,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    50,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    51,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    52,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOCFGWR",
+   "args": [
+    57,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    24,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    44,
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "IOSET",
+   "args": [
+    45,
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "NRST",
+   "args": [
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "NRST",
+   "args": [
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "NRST",
+   "args": [
+    0
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "NRST",
+   "args": [
+    1
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 512,
+   "val": [
+    1
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "CFG2WR",
+   "args": [
+    38,
+    2,
+    5,
+    238,
+    63,
+    224,
+    4,
+    0,
+    4,
+    0,
+    10,
+    100
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "CFG2WR",
+   "args": [
+    38,
+    2,
+    5,
+    238,
+    63,
+    224,
+    4,
+    0,
+    4,
+    0,
+    10,
+    100
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 2400,
+   "val": [
+    28
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 2410,
+   "val": [
+    60,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 544,
+   "val": [
+    0,
+    27,
+    183,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 548,
+   "val": [
+    2
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 550,
+   "val": [
+    134
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 549,
+   "val": [
+    1
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 551,
+   "val": [
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 513,
+   "val": [
+    4
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 513,
+   "val": [
+    4
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 770,
+   "val": [
+    2
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1100,
+   "val": [
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1114,
+   "val": [
+    0,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1116,
+   "val": [
+    79,
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1122,
+   "val": [
+    0,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1124,
+   "val": [
+    79,
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1076,
+   "val": [
+    0,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1080,
+   "val": [
+    79,
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1118,
+   "val": [
+    2,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1120,
+   "val": [
+    97,
+    4
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1114,
+   "val": [
+    0,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1116,
+   "val": [
+    79,
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1122,
+   "val": [
+    0,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1124,
+   "val": [
+    79,
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1076,
+   "val": [
+    0,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1080,
+   "val": [
+    79,
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1118,
+   "val": [
+    2,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1120,
+   "val": [
+    97,
+    4
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1112,
+   "val": [
+    120,
+    8
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1102,
+   "val": [
+    232,
+    3
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1114,
+   "val": [
+    0,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1116,
+   "val": [
+    79,
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1122,
+   "val": [
+    0,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1124,
+   "val": [
+    79,
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1076,
+   "val": [
+    0,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1080,
+   "val": [
+    79,
+    5
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1118,
+   "val": [
+    2,
+    0
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 1120,
+   "val": [
+    97,
+    4
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "CFG2WR",
+   "args": [
+    38,
+    2,
+    5,
+    238,
+    63,
+    224,
+    4,
+    0,
+    4,
+    0,
+    10,
+    100
+   ]
+  },
+  {
+   "op": "cmd",
+   "cmd": "CFG2WR",
+   "args": [
+    38,
+    2,
+    5,
+    238,
+    63,
+    224,
+    4,
+    0,
+    4,
+    0,
+    10,
+    100
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 513,
+   "val": [
+    1
+   ]
+  },
+  {
+   "op": "write",
+   "reg": 514,
+   "val": [
+    1
+   ]
+  }
+ ]
+}
