@@ -73,6 +73,14 @@
           <option value="10">10 (RAW10)</option>
         </select>
       </label>
+      <label>USB-2 slow mode
+        <select id="slowmode" style="padding:.3rem;font-size:.9rem;">
+          <option value="1" selected>Off (SuperSpeed)</option>
+          <option value="4">4× slower (~29 MB/s)</option>
+          <option value="6">6× slower (~19 MB/s)</option>
+          <option value="12">12× slower (~10 MB/s)</option>
+        </select>
+      </label>
     </div>
     <p class="hint">Leave endpoint fields blank to auto-discover from the interface descriptors (first bulk-OUT = command, small bulk-IN = answer, large bulk-IN = video).</p>
   </fieldset>

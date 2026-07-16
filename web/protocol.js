@@ -565,7 +565,7 @@ export async function fetchFirmwareJson(name) {
   throw new Error(`could not fetch ${name} (tried ${tried.join(", ")})`);
 }
 
-export async function replayColdInit(sensor, url) {
+export async function replayColdInit(sensor, url, mods = null) {
   const doc = url
     ? await (async () => { const r = await fetch(url); if (!r.ok) throw new Error(`cold-init fetch failed: HTTP ${r.status} (${url})`); return r.json(); })()
     : await fetchFirmwareJson("vd56g3_cold_init.json");
@@ -585,18 +585,27 @@ export async function replayColdInit(sensor, url) {
   let bpp = 8;
   for (const step of steps) {
     if (step.op === "write") {
-      writes[step.reg] = step.val;
+      // Optional per-register value overrides (`mods` = { reg: [le bytes] }) —
+      // used by the USB-2 slow mode to retune the clock tree / exposure while
+      // keeping the hardware-proven ordering untouched.
+      let val = step.val;
+      if (mods && Object.prototype.hasOwnProperty.call(mods, step.reg)) {
+        val = mods[step.reg];
+        sensor.console.log(`~ slow-mode override: reg 0x${step.reg.toString(16).padStart(4, "0")} ` +
+                           `[${step.val.join(",")}] -> [${val.join(",")}]`);
+      }
+      writes[step.reg] = val;
       // Command registers need the self-clear handshake (PROTOCOL.md §9.0) —
       // a back-to-back replay outruns the sensor and commands get dropped.
-      if (cmdRegs.has(step.reg) && step.val.length === 1) {
-        await sensor.sendCommand(step.reg, step.val[0]);
+      if (cmdRegs.has(step.reg) && val.length === 1) {
+        await sensor.sendCommand(step.reg, val[0]);
         if (step.reg === REG.CMD_BOOT) {
           await sensor.waitFsm(2, 2000, "(post-CMD_BOOT)");
-        } else if (step.reg === REG.CMD_START_STREAM && step.val[0] === 1) {
+        } else if (step.reg === REG.CMD_START_STREAM && val[0] === 1) {
           await sensor.waitFsm(3, 5000, "(post-CMD_START_STREAM)");
         }
       } else {
-        await sensor.writeRegBytes(step.reg, step.val);
+        await sensor.writeRegBytes(step.reg, val);
         await sleep(10);
       }
     } else {

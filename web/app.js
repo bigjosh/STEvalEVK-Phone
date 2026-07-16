@@ -213,12 +213,16 @@ async function onConnect() {
     // overflows and stalls EP 0x83 forever ("video attempt ... stall").
     const pkt = state.eps.videoPacketSize || 0;
     if (pkt === 512) {
-      setStatus("USB 2 link — video cannot work. Change the cable.");
-      log(`*** LINK IS USB 2 (HighSpeed): video max packet = 512. The video stream`);
-      log(`*** CANNOT flow at this speed — capture WILL fail with stalls. Use a`);
-      log(`*** genuine 5 Gbps (USB 3) C-to-C cable — phone charging cables are USB 2.`);
+      setStatus("USB 2 link — using slow mode.");
+      log(`*** LINK IS USB 2 (HighSpeed): video max packet = 512. At full speed the`);
+      log(`*** video overflows the CX3 and stalls. Slow mode retunes the sensor's VT`);
+      log(`*** clock so full-res frames fit through USB 2 at a lower frame rate.`);
+      if ($("slowmode").value === "1") {
+        $("slowmode").value = "6";
+        log(`Auto-selected "USB-2 slow mode: 6x" (~19 MB/s). Change it in Options if needed.`);
+      }
     } else {
-      log(`Link looks SuperSpeed (video max packet = ${pkt}). Good for video.`);
+      log(`Link looks SuperSpeed (video max packet = ${pkt}). Good for full-rate video.`);
     }
 
     // Build the console + sensor helpers.
@@ -266,12 +270,34 @@ async function onCapture() {
       log(`VERSION failed (continuing): ${err.message}`);
     }
 
+    // ---- USB-2 slow mode (experimental) -----------------------------------
+    // Full-res over a USB-2 High-Speed link: slow the sensor's VT clock so
+    // pixels are PRODUCED slower than USB 2 drains (~35-40 MB/s). The captured
+    // init runs the clock tree at 12 MHz ext -> PLL -> VT_CLK_DIV (0x0227)=5
+    // -> 160.8 MHz VT clock -> ~115 MB/s wire rate @ 60 fps. Multiplying the
+    // divider by N divides the wire rate (and fps) by N. Exposure is counted
+    // in LINES (0x044E=1000), so scale it down by N to keep brightness.
+    const slowFactor = parseInt($("slowmode").value, 10) || 1;
+    let mods = null;
+    if (slowFactor > 1) {
+      const div = 5 * slowFactor;              // VT_CLK_DIV: 20 / 30 / 60
+      const exp = Math.max(1, Math.round(1000 / slowFactor));
+      mods = {
+        0x0227: [div & 0xff],
+        0x044E: [exp & 0xff, (exp >> 8) & 0xff],
+      };
+      log(`USB-2 slow mode ${slowFactor}x: VT_CLK_DIV 5 -> ${div}, ` +
+          `COARSE_EXPOSURE 1000 -> ${exp} (~${(114.6 / slowFactor).toFixed(1)} MB/s, ` +
+          `~${(60 / slowFactor).toFixed(0)} fps). EXPERIMENTAL — if the sensor rejects ` +
+          `the divider you'll see "command not consumed" / "SYSTEM_FSM=2" below.`);
+    }
+
     // ---- Cold-init: replay the hardware-captured sequence (PROTOCOL.md §9) --
     // No FW patch — the VD56G3 streams unpatched. Plays the exact ordered
     // commands ST's GUI sent, with the §9.0 self-clear command handshake, and
     // ends at CMD_START_STREAM<-1: the sensor is STREAMING when this returns.
     setStatus("Replaying captured cold-init...");
-    const geo = await replayColdInit(sensor);  // resolves firmware/ in dev or deployed
+    const geo = await replayColdInit(sensor, undefined, mods);
     const { width, height } = geo;
     bpp = geo.bpp;
     log(`Cold-init replayed: streaming ${width}x${height} bpp=${bpp} (no patch).`);
@@ -286,8 +312,11 @@ async function onCapture() {
     const payloadSize = (2 + height) * widthBytes;   // 2 status lines + rows
     const wireTotal = wireFrameSize(payloadSize);    // + 16 B header/footer per 16 KB chunk
     log(`Expecting ${wireTotal} wire bytes (payload ${payloadSize}).`);
+    const t0 = performance.now();
     const raw = await state.console.readFramePrequeued(sensor, wireTotal);
-    log(`Read ${raw.length} wire bytes from video bulk-IN.`);
+    const dt = (performance.now() - t0) / 1000;
+    log(`Read ${raw.length} wire bytes in ${dt.toFixed(2)} s ` +
+        `(~${(raw.length / dt / 1e6).toFixed(1)} MB/s incl. stream start).`);
 
     // ---- Stop streaming (0x0202 <- 1, self-clearing — PROTOCOL.md §9.0) ---
     try { await sensor.stopStream(); log("Streaming stopped (CMD_STOP_STREAM 0x0202 <- 1)."); }
@@ -352,7 +381,7 @@ function renderFrame(frame) {
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16c (pre-queued frame read + link-speed check)";
+const APP_BUILD = "2026-07-16d (USB-2 slow mode: VT-clock retune for full-res over HighSpeed)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);
