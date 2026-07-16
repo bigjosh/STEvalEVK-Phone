@@ -116,11 +116,41 @@ across the USB-2 link:
   7.69 µs/line @ 160.8 MHz VT ✓ 60 fps × 2168 lines); `0x0312` reads 1010 =
   MIPI Mbps.
 
+## 2026-07-16 (late): exposure control solved — datasheet + bench validated
+
+User dropped the datasheets into `datasheets/` (UM2602 Rev 8 is the register
+bible) and put the board back on the PC — which enumerated at **HighSpeed**,
+i.e. phone-identical conditions, making the bench a perfect phone proxy. Full
+matrix validated on hardware (see PROTOCOL.md §10 for the distilled spec):
+
+- **Manual exposure**: `EXP_MODE (0x044C)=2` + `MANUAL_COARSE_EXPOSURE
+  (0x044E)` via ST's `GROUP_PARAM_HOLD (0x0448)` latch. Brightness ladder
+  120/480/1900 lines → mean 111/248/723. **Live-tunable while streaming.**
+  Over-max clips safely. Applied values readable at 0x0064/0x0072.
+- **Auto exposure**: the init's `0x044C←0` turns AEC on; it owns
+  exposure+gains (why bare 0x044E writes did nothing). Warm-up capture (read
+  ~15 frames, keep last) converges: 15/15 frames, 0 stalls, 1.02 s over HS 4×.
+- **Phone "hang after capture" root cause (app-side)**: WebUSB transfers
+  can't be cancelled; retries after a timeout stacked abandoned 2 MB
+  transferIns and wedged the endpoint. Fixed: at most ONE video transfer in
+  flight, reused across attempts. Plus ?v= cache-busting (stale Pages HTML).
+- Phone 12× "FSM=255" is the **documented ERROR state** (UM2602 §9), not a
+  dead sensor — `ERROR_CODE (0x001C)` names the reason and the app now reads
+  it automatically. Bench 6×–12× init clean; clock-tree changes (VT_CLK_DIV)
+  are the thing that genuinely kills it (pixel clock is pinned to 160.8 MHz).
+- Mystery closed: the captured `0x0201←04` writes are THSENS_READ (thermal).
+
+Web app: **build 2026-07-16i** deployed (GPH exposure latch, applied-mode
+readback, ERROR_CODE diagnostics, single-outstanding-transfer fix).
+
 ## Next actions (optional polish)
 
-1. Tune exposure defaults / test 6× slow mode if ~10 fps at lower USB load is
-   ever wanted; a genuine 5 Gbps C-to-C cable enables full-rate (slow mode Off).
-2. Termux path (`termux_grab.py`) and the CI-built Kotlin APK remain as
+1. Add analog/digital gain sliders if wanted: `0x044D` (32/(32−code), ×1–×8,
+   raise `MAX_AG_CODED 0x0960` in standby for >×4) and `0x0450` (FP5.8) —
+   documented + register file updated, not yet in the UI.
+2. Tune exposure defaults / test 6× slow mode; a genuine 5 Gbps C-to-C cable
+   enables full-rate (slow mode Off). PC's current port/cable is HS-only too.
+3. Termux path (`termux_grab.py`) and the CI-built Kotlin APK remain as
    researched fallbacks — not needed now that WebUSB works end-to-end.
-3. (Optional) If the enhanced firmware is ever wanted, sniff a GUI session that
+4. (Optional) If the enhanced firmware is ever wanted, sniff a GUI session that
    *does* patch and reconstruct the blob — but it is not needed to capture frames.

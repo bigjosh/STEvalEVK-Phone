@@ -492,3 +492,69 @@ The decisive results:
   **height 1360**, **RAW10** (final `CFG2WR` bpp = 10). Note the format register
   `0x030A` is *not* written — format comes from `CFG2WR`. (Video is snaplen-
   truncated at 64 KB/URB, so a full real-frame decode still needs on-device data.)
+
+---
+
+## 10. Sensor control — UM2602-verified + hardware-validated (2026-07-16)
+
+With ST's UM2602 Rev 8 in `datasheets/` the guesswork is over. Everything below
+is documented AND was verified against the live board (bench scripts in the
+session scratchpad; results in STATE.md).
+
+### 10.1 Commands (0x0200–0x0203) and states
+
+Write the value, then **poll the same register until it reads 0** (= CMD_ACK).
+A command issued before the previous ACK is IGNORED (§9.0 confirmed by doc).
+
+| Reg | Values |
+|---|---|
+| `0x0200` BOOT | `01`=BOOT, `02`=PATCH_SETUP |
+| `0x0201` SW_STANDBY | `01`=START_STREAM, `02`=NVM_READ, `03`=NVM_PROG, `04`=THSENS_READ, `05`=I2C_ADDR_UPDATE |
+| `0x0202` STREAMING | `01`=STOP_STREAM, `02`=VT_FSYNC_IN_I2C |
+| `0x0203` VTPATCHING | `01`=START_VTRAM_UPDATE, `02`=END_VTRAM_UPDATE |
+
+(The captured init's `0x0201←04` writes are **thermal-sensor reads**, nothing
+to do with standby/exposure.)
+
+`SYSTEM_FSM (0x0028)`: 0=HW_STANDBY, 1=READY_TO_BOOT, 2=SW_STANDBY,
+3=STREAMING, **0xFF=ERROR**. In ERROR the reason is readable at
+**`ERROR_CODE (0x001C, u16)`** (e.g. 0xa00 LONG_COARSE_MAX, 0xa03
+ISB_LONG_PIPE_OVERFLOW, 0xc00 CSI_LANE_DESYNC) and the device needs a reset
+(our NRST pulses at init recover it).
+
+### 10.2 Exposure (context 0) — hardware-validated
+
+- `0x044C` **EXP_MODE**: 0=Automatic (AEC owns exposure+gains and overrides
+  manual writes), 1=Freeze AE, **2=Manual**. The captured init writes 0 (AE on).
+- `0x044E` **MANUAL_COARSE_EXPOSURE** (u16, line periods): min 21 lines
+  (ADC10), max `FRAME_LENGTH − EXP_COARSE_INTG_MARGIN(68) − 7`; out-of-range
+  values **clip safely** (bench-verified, no ERROR).
+- `0x044D` **MANUAL_ANALOG_GAIN**: code 0–28, gain = 32/(32−code) → ×1..×8,
+  clipped to ×4 by default (`MAX_AG_CODED 0x0960`, Misc, SW_STANDBY-only).
+- `0x0450` **MANUAL_DIGITAL_GAIN_CH0** (FP5.8, `0x0100`=×1.0): ×1..×8.
+- **Latch protocol (GROUP_PARAM_HOLD `0x0448`)**: write 1 → update the
+  EXP_MODE/MANUAL_*/AE_*/ROI registers → write 0; firmware applies atomically
+  on release (AE frozen while held). Works in SW_STANDBY **and live during
+  STREAMING** (bench: live exposure change mid-stream works).
+- Applied-value readbacks (STATUS, per frame): `0x0064` coarse, `0x0068`
+  analog gain, `0x006A` digital gain, `0x0072` AE_MODE, `0x0073` AE_STATUS
+  (1=converged), `0x0074` AE_MEAN_ENERGY. (`0x004C` is the TEMPERATURE.)
+- AEC tuning (DYNAMIC): `0x043C` AE_TARGET_PERCENTAGE (default 27%),
+  `0x043A` AE_COMPENSATION, coldstart regs `0x0428–0x042E`.
+
+### 10.3 Timing groups and the slow-mode rationale
+
+- `0x0300` **LINE_LENGTH** (STATIC, u16, pixel clocks): min 1236 (10-bit ADC),
+  **no documented max**; ST: long lines "may allow interoperability with low
+  frequency MIPI receivers" — exactly our USB-2 slow mode. STATIC +
+  SENSOR_SETTINGS (0x0220 clock tree) + Misc groups are **SW_STANDBY-only**
+  (latch at next START_STREAM); CONTEXT + DYNAMIC groups are writable in
+  standby or streaming.
+- `0x0458` FRAME_LENGTH (u16, lines): min = ROI height/subsampling + ~69.
+  Frame rate = 1/(line_time × FRAME_LENGTH).
+- **Clock tree is pinned**: pixel clock must be ≈160.8 MHz (10-bit; 201 MHz
+  9-bit), PLL out 790–805 MHz, VCO 0.5–1 GHz → `VT_CLK_DIV (0x0227)`
+  effectively must stay 5 (4 in 9-bit mode). Off-spec dividers take down the
+  sensor's internal MCU (shares the PLL tree) — do NOT retune clocks; stretch
+  `LINE_LENGTH` instead.
+- Applied LINE_LENGTH/FRAME_LENGTH readbacks: STATUS `0x0078`/`0x007C`.

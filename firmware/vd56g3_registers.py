@@ -8,16 +8,25 @@ little-endian (LSB first) on the wire; register *addresses* are 16-bit
 big-endian (see PROTOCOL.md §3.1).
 """
 
-# --- status / identity ---------------------------------------------------
+# --- status / identity (UM2602 Rev 8 STATUS group, read-only, per-frame) ---
 DEVICE_MODEL_ID       = 0x0000  # u16
 DEVICE_REVISION       = 0x0002  # u16
-ERROR_CODE            = 0x001C  # u16
+ERROR_CODE            = 0x001C  # u16  nonzero when SYSTEM_FSM=0xFF (ERROR state)
 FWPATCH_REVISION      = 0x001E  # u16  -> expect 5.x after main patch ("FW=5.0")
 VTIMING_RD_REVISION   = 0x0020  # u32  -> expect 17 after VT patch ("VT=17")
-SYSTEM_FSM            = 0x0028  # u8   -> boot state machine (poll for ready)
+SYSTEM_FSM            = 0x0028  # u8   0=HW_STBY 1=READY_TO_BOOT 2=SW_STBY 3=STREAMING 0xFF=ERROR
+TEMPERATURE           = 0x004C  # u10  degrees C (was misread as AE status earlier)
 FRAME_COUNTER         = 0x0050  # u16  (also surfaced in status line)
 CURRENT_CONTEXT       = 0x0056  # u8
 FORMAT_CTRL_STATUS    = 0x005B  # u8   (status-line copy of format ctrl / bpp)
+APPLIED_COARSE_EXP    = 0x0064  # u16  lines — what the sensor is actually using
+APPLIED_ANALOG_GAIN   = 0x0068  # u5   code; gain = 32/(32-code)
+APPLIED_DIGITAL_GAIN  = 0x006A  # FP5.8
+AE_MODE_STATUS        = 0x0072  # u2   applied exposure mode (0 auto/1 freeze/2 manual)
+AE_STATUS             = 0x0073  # u1   1 = AE converged
+AE_MEAN_ENERGY        = 0x0074  # FP8.8 mean image energy
+APPLIED_LINE_LENGTH   = 0x0078  # u16
+APPLIED_FRAME_LENGTH  = 0x007C  # u16
 
 # --- commands ------------------------------------------------------------
 # Command registers self-clear to 0 once the sensor consumes the command
@@ -38,8 +47,27 @@ CMD_DEBUG             = 0x0203  # u8   1=enter patch mode, 2=exit  (VT patch)
 CMD_STBY              = CMD_START_STREAM
 CMD_STREAMING         = CMD_STOP_STREAM
 
-# --- static stream config ------------------------------------------------
+# --- static stream config (STATIC group: SW_STANDBY-only, latches at
+# --- START_STREAM — UM2602 §19.4) ------------------------------------------
+LINE_LENGTH           = 0x0300  # u16  pixel clocks/line; min 1236 (10-bit ADC),
+                                #      no documented max. Long lines = ST-sanctioned
+                                #      way to slow output for slow receivers
+                                #      (our USB-2 slow mode multiplies this).
 STATICS_FORMAT_CTRL   = 0x030A  # u16  bits/pixel (8 or 10)
+OIF_CSI_BITRATE       = 0x0312  # u16  Mbps/lane (device runs 1010)
+
+# --- exposure control, context 0 (UM2602 §14.7; hardware-validated) --------
+# CONTEXT + DYNAMIC groups are writable in SW_STANDBY or STREAMING. Wrap
+# changes in GROUP_PARAM_HOLD: write 1 -> update -> write 0 (applied
+# atomically on release; AE frozen while held).
+GROUP_PARAM_HOLD      = 0x0448  # u1   GPH latch (DYNAMIC group)
+CTX0_EXP_MODE         = 0x044C  # u2   0=Automatic AEC / 1=Freeze / 2=Manual
+CTX0_MANUAL_AGAIN     = 0x044D  # u5   code 0..28; gain = 32/(32-code) (x1..x8,
+                                #      clipped to x4 by default via 0x0960)
+CTX0_MANUAL_COARSE    = 0x044E  # u16  lines; min 21, max FRAME_LENGTH-75;
+                                #      out-of-range clips safely
+CTX0_MANUAL_DGAIN_CH0 = 0x0450  # FP5.8 x1.0..x8.0 (CH0 suffices on mono)
+CTX0_FRAME_LENGTH     = 0x0458  # u16  lines/frame (frame rate = 1/(line_t * FL))
 
 # --- context 0 readout / ROI ---------------------------------------------
 CONTEXTS_READOUT_CTRL = 0x0474  # u8
