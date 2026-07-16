@@ -11,7 +11,7 @@
 import {
   Cx3Console, Vd56g3,
   replayColdInit, decodeFrame, wireFrameSize,
-} from "./protocol.js?v=16h"; // ?v= keeps protocol.js in lockstep with app.js
+} from "./protocol.js?v=16i"; // ?v= keeps protocol.js in lockstep with app.js
 
 // VID:PID of the EVK (PROTOCOL.md §1).
 const VENDOR_ID = 0x0553;
@@ -327,23 +327,32 @@ async function onCapture() {
     const manualExposure = expmodeEl ? expmodeEl.value === "manual" : true;
     const linePeriodS = (LINE_LENGTH_DEFAULT * slowFactor) / VT_CLOCK_HZ;
     const wantMs = parseFloat($("expms") ? $("expms").value : "15") || 15;
-    const expLines = Math.min(FRAME_LENGTH_LINES - 8,
-                              Math.max(1, Math.round(wantMs / 1000 / linePeriodS)));
+    // UM2602 Rev 8 §14.7 (hardware-validated): coarse exposure 21 lines min
+    // (ADC 10-bit), max = FRAME_LENGTH - margin(68) - 7; over-range clips.
+    const expLines = Math.min(FRAME_LENGTH_LINES - 75,
+                              Math.max(21, Math.round(wantMs / 1000 / linePeriodS)));
     const effMs = expLines * linePeriodS * 1000;
-    let mods = { overrides: {} };
+    let mods = { preStart: [] };
     if (manualExposure) {
-      mods.overrides[0x044C] = [0x02]; // CTX0_EXP_MODE: 0=auto -> 2=manual (empirical test)
-      mods.overrides[0x044E] = [expLines & 0xff, (expLines >> 8) & 0xff];
-      log(`Manual exposure: ${wantMs.toFixed(1)} ms -> COARSE_EXPOSURE=${expLines} lines ` +
+      // ST's documented GROUP_PARAM_HOLD latch (UM2602 Table 26/27): hold ->
+      // update EXP_MODE + MANUAL_COARSE_EXPOSURE -> release (applied atomically).
+      mods.preStart.push(
+        { reg: 0x0448, val: [1] },                                       // GROUP_PARAM_HOLD
+        { reg: 0x044C, val: [2] },                                       // EXP_MODE = Manual
+        { reg: 0x044E, val: [expLines & 0xff, (expLines >> 8) & 0xff] }, // MANUAL_COARSE_EXPOSURE
+        { reg: 0x0448, val: [0] },                                       // release
+      );
+      log(`Manual exposure (GPH latch): ${wantMs.toFixed(1)} ms -> ${expLines} lines ` +
           `(${effMs.toFixed(1)} ms effective at ${(linePeriodS * 1e6).toFixed(1)} us/line` +
-          `${effMs < wantMs - 0.3 ? " — CLAMPED by frame length; slower mode allows longer" : ""}), ` +
-          `EXP_MODE 0 -> 2.`);
+          `${effMs < wantMs - 0.3 ? " — CLAMPED; a slower mode allows longer exposures" : ""}).`);
     } else {
       log(`Auto exposure: AE stays on; will stream ~15 warm-up frames and keep the last.`);
     }
     if (slowFactor > 1) {
       const lineLen = LINE_LENGTH_DEFAULT * slowFactor;   // 4944 / 7416 / 14832 (u16 ok)
-      mods.preStart = [{ reg: 0x0300, val: [lineLen & 0xff, (lineLen >> 8) & 0xff] }];
+      // LINE_LENGTH is a STATIC register: latches at the next START_STREAM
+      // (UM2602 §19.4) — inject BEFORE the GPH exposure block.
+      mods.preStart.unshift({ reg: 0x0300, val: [lineLen & 0xff, (lineLen >> 8) & 0xff] });
       log(`USB-2 slow mode ${slowFactor}x (line stretch): LINE_LENGTH 0x0300 ` +
           `${LINE_LENGTH_DEFAULT} -> ${lineLen} ` +
           `(~${(114.6 / slowFactor).toFixed(1)} MB/s, ~${(60 / slowFactor).toFixed(0)} fps). ` +
@@ -369,10 +378,17 @@ async function onCapture() {
                    `(wanted ${LINE_LENGTH_DEFAULT * slowFactor})`);
       }
       if (manualExposure) {
-        parts.push(`EXP_MODE(0x044C)=${await sensor.read8(0x044C)} (wanted 2)`);
+        // 0x0072 AE_MODE is the APPLIED mode (UM2602 STATUS group) — the
+        // authoritative confirmation that the GPH latch took effect.
+        parts.push(`applied AE_MODE(0x0072)=${await sensor.read8(0x0072)} (wanted 2)`);
         parts.push(`COARSE_EXPOSURE(0x044E)=${await sensor.read16(0x044E)} (wanted ${expLines})`);
       }
-      parts.push(`SYSTEM_FSM=${await sensor.read8(0x0028)}`);
+      const fsm = await sensor.read8(0x0028);
+      parts.push(`SYSTEM_FSM=${fsm}`);
+      if (fsm === 0xff) {
+        // Documented ERROR state (UM2602 §9): the reason is readable.
+        parts.push(`sensor ERROR state! ERROR_CODE(0x001C)=0x${(await sensor.read16(0x001C)).toString(16)}`);
+      }
       log(`Readback: ${parts.join(", ")}.`);
     } catch (err) {
       log(`Readback failed: ${err.message}`);
@@ -459,8 +475,7 @@ function renderFrame(frame) {
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16h (single-outstanding video transfer fix; bench-validated exposure: " +
-  "EXP_MODE=2 manual confirmed, ladder 120/480/1900 lines -> mean 111/248/723, AE warm-up 15 frames/1s ok)";
+const APP_BUILD = "2026-07-16i (UM2602-documented GPH exposure latch; datasheet+hardware validated)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);
