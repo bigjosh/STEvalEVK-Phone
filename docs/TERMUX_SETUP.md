@@ -1,8 +1,37 @@
-# TERMUX_SETUP.md — running `grab.py` on an Android phone
+# TERMUX_SETUP.md — capture a frame on an Android phone
 
 On-phone steps to drive the STEVAL-EVK-U0I (CX3 + VD56G3) from Termux and save
-one frame. This is the Phase-1 target: a pure-Python (pyusb/libusb) host, since
-ST ships **no aarch64 build** of its SDK (see `PROTOCOL.md`, `STATE.md`).
+one frame. This is the Phase-1 target (ST ships **no aarch64 build** of its SDK).
+Use this route when the WebUSB app can't claim the interface — libusb here can
+**force-detach** the interface, which Chrome-for-Android's WebUSB cannot.
+
+## Quickstart — the direct path (`termux_grab.py`, recommended)
+
+`termux_grab.py` is self-contained: **libusb via ctypes, no pyusb/numpy/Pillow**.
+It force-detaches + claims both interfaces, replays the captured init (no patch),
+reads one RAW10 frame, and writes `frame.pgm` (viewable) + `frame.raw`.
+
+```sh
+pkg install python libusb git
+git clone https://github.com/bigjosh/STEvalEVK-Phone && cd STEvalEVK-Phone
+chmod +x run_grab.sh
+termux-usb -l                                   # find the EVK, e.g. /dev/bus/usb/001/002
+termux-usb -r -e ./run_grab.sh /dev/bus/usb/001/002
+termux-open frame.pgm                           # view the captured image
+```
+
+`termux-usb -r` pops the Android permission dialog and hands the device fd to the
+wrapper, which runs `python termux_grab.py <fd>`. Add `-v` (edit `run_grab.sh` or
+run `python termux_grab.py --fd <N> -v`) to log every console transaction.
+
+If the console answers `VERSION -> OK 01 07 01` but frames don't arrive, it's
+almost always the **cable** (needs genuine 5 Gbps) — the bulk video starves on
+USB 2 even though the console works.
+
+The `evk/` + `grab.py` pyusb version below is the structured alternative; prefer
+`termux_grab.py` for the first capture (fewer moving parts).
+
+---
 
 ## 0. Hardware prerequisites
 
