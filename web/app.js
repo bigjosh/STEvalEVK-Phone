@@ -11,7 +11,7 @@
 import {
   Cx3Console, Vd56g3,
   replayColdInit, decodeFrame, wireFrameSize,
-} from "./protocol.js?v=16l"; // ?v= keeps protocol.js in lockstep with app.js
+} from "./protocol.js?v=16m"; // ?v= keeps protocol.js in lockstep with app.js
 
 // VID:PID of the EVK (PROTOCOL.md §1).
 const VENDOR_ID = 0x0553;
@@ -284,7 +284,7 @@ async function onCapture() {
     if (link.href) URL.revokeObjectURL(link.href);
     link.removeAttribute("href");
     link.classList.add("disabled");
-    link.textContent = "Download JPEG";
+    link.textContent = "Download PNG";
   }
   try {
     let bpp = parseInt($("bpp").value, 10) === 10 ? 10 : 8; // replay overrides this
@@ -461,24 +461,27 @@ function renderFrame(frame) {
   }
   ctx.putImageData(imgData, 0, 0);
 
-  // Export a JPEG via canvas.toBlob and enable the download link.
-  // Quality 1.0 = minimal compression (biggest file, fewest artifacts).
+  // Export a PNG (lossless) via canvas.toBlob and enable the download link.
+  // Filename is a datetime stamp so successive captures never collide.
   canvas.toBlob((blob) => {
-    if (!blob) { log("toBlob returned null — JPEG export unavailable."); return; }
+    if (!blob) { log("toBlob returned null — PNG export unavailable."); return; }
     const link = $("download");
     if (link.href) URL.revokeObjectURL(link.href);
     link.href = URL.createObjectURL(blob);
-    link.download = `evk_frame_${frame.frameCounter}.jpg`;
+    const t = new Date();
+    const p = (n) => String(n).padStart(2, "0");
+    link.download = `evk_${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}` +
+                    `_${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}.png`;
     link.classList.remove("disabled");
-    link.textContent = `Download JPEG (${(blob.size / 1024).toFixed(1)} KB, q=1.0)`;
-    log(`JPEG ready (${blob.size} bytes, quality 1.0).`);
-  }, "image/jpeg", 1.0);
+    link.textContent = `Download PNG (${(blob.size / 1024).toFixed(0)} KB, lossless)`;
+    log(`PNG ready (${blob.size} bytes) as ${link.download}.`);
+  }, "image/png");
 }
 
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16l (JPEG export at quality 1.0 — minimal compression)";
+const APP_BUILD = "2026-07-16m (lossless PNG export; datetime-stamped filenames)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);

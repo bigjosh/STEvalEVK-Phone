@@ -52,7 +52,7 @@
 </head>
 <body>
   <h1>STEVAL-EVK-U0I — WebUSB one-frame grab</h1>
-  <p class="sub">CX3 + VD56G3 · replays init → first frame · exports JPEG. Requires Chrome for Android over HTTPS.</p>
+  <p class="sub">CX3 + VD56G3 · replays init → first frame · exports lossless PNG. Requires Chrome for Android over HTTPS.</p>
 
   <div class="row">
     <button id="connect">Connect</button>
@@ -100,13 +100,13 @@
 
   <canvas id="preview" width="320" height="200"></canvas>
   <div class="row">
-    <a id="download" class="disabled" href="#">Download JPEG</a>
+    <a id="download" class="disabled" href="#">Download PNG</a>
   </div>
 
   <pre id="log"></pre>
 
   <!-- ES modules; app.js imports protocol.js. No external scripts.
        ?v= busts stale cached JS whenever the HTML updates. -->
-  <script type="module" src="./app.js?v=16l"></script>
+  <script type="module" src="./app.js?v=16m"></script>
 </body>
 </html>
