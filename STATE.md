@@ -94,6 +94,10 @@ video is snaplen-truncated).
    the decoder is only synthetic-tested. First real frame from the Pixel confirms
    the status-line strip + RAW10 unpack at 1120×1360; adjust width if the ROI
    differs from the captured 1120.
-3. **Deploy `web/` to GitHub Pages** and repeat from Chrome for Android.
+3. **Phase 2 is deployed** → https://bigjosh.github.io/STEvalEVK-Phone/ (via
+   `.github/workflows/pages.yml`). Open in Chrome for Android and try Connect →
+   Capture. The EVK splits endpoints across two interfaces (video `0x83` on if0,
+   console `0x05`/`0x85` on if1 — confirmed from the device descriptor); the web
+   app now claims both. WebUSB has not been run against the device yet.
 4. (Optional) If the enhanced firmware is ever wanted, sniff a GUI session that
    *does* patch and reconstruct the blob — but it is not needed to capture frames.
