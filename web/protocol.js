@@ -566,6 +566,15 @@ export async function fetchFirmwareJson(name) {
 }
 
 export async function replayColdInit(sensor, url, mods = null) {
+  // mods (all optional): {
+  //   overrides: { reg: [le bytes] }   value overrides for steps already in the
+  //                                    captured sequence,
+  //   preStart:  [{ reg, val }]        extra register writes injected right
+  //                                    before CMD_START_STREAM (for statics the
+  //                                    GUI leaves at defaults, e.g. LINE_LENGTH),
+  // }
+  const overrides = (mods && mods.overrides) || null;
+  const preStart = (mods && mods.preStart) || [];
   const doc = url
     ? await (async () => { const r = await fetch(url); if (!r.ok) throw new Error(`cold-init fetch failed: HTTP ${r.status} (${url})`); return r.json(); })()
     : await fetchFirmwareJson("vd56g3_cold_init.json");
@@ -583,14 +592,22 @@ export async function replayColdInit(sensor, url, mods = null) {
   const cmdRegs = new Set([REG.CMD_BOOT, REG.CMD_START_STREAM, REG.CMD_STOP_STREAM]);
   const writes = {};
   let bpp = 8;
+  let injected = false;
   for (const step of steps) {
     if (step.op === "write") {
-      // Optional per-register value overrides (`mods` = { reg: [le bytes] }) —
-      // used by the USB-2 slow mode to retune the clock tree / exposure while
-      // keeping the hardware-proven ordering untouched.
+      // Inject extra statics writes right before the stream starts (slow mode).
+      if (step.reg === REG.CMD_START_STREAM && preStart.length && !injected) {
+        injected = true;
+        for (const w of preStart) {
+          sensor.console.log(`~ slow-mode inject: reg 0x${w.reg.toString(16).padStart(4, "0")} <- [${w.val.join(",")}]`);
+          await sensor.writeRegBytes(w.reg, w.val);
+          await sleep(10);
+        }
+      }
+      // Optional value overrides for steps already in the captured sequence.
       let val = step.val;
-      if (mods && Object.prototype.hasOwnProperty.call(mods, step.reg)) {
-        val = mods[step.reg];
+      if (overrides && Object.prototype.hasOwnProperty.call(overrides, step.reg)) {
+        val = overrides[step.reg];
         sensor.console.log(`~ slow-mode override: reg 0x${step.reg.toString(16).padStart(4, "0")} ` +
                            `[${step.val.join(",")}] -> [${val.join(",")}]`);
       }

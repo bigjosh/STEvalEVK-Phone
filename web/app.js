@@ -23,11 +23,27 @@ const PRODUCT_ID = 0x040a;
 const $ = (id) => document.getElementById(id);
 const logEl = () => $("log");
 
-function log(msg) {
+// Buffered logging: on phones, a DOM append + reflow per line adds real
+// latency between USB transactions. Lines are queued and flushed in one DOM
+// write every 100 ms; the log is trimmed to the last 500 lines.
+const _logBuf = [];
+let _logTimer = null;
+
+function _flushLog() {
+  _logTimer = null;
+  if (!_logBuf.length) return;
   const el = logEl();
-  const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
-  el.textContent += `[${ts}] ${msg}\n`;
+  el.textContent += _logBuf.join("\n") + "\n";
+  _logBuf.length = 0;
+  const lines = el.textContent.split("\n");
+  if (lines.length > 500) el.textContent = lines.slice(-500).join("\n");
   el.scrollTop = el.scrollHeight;
+}
+
+function log(msg) {
+  const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+  _logBuf.push(`[${ts}] ${msg}`);
+  if (!_logTimer) _logTimer = setTimeout(_flushLog, 100);
 }
 
 function setStatus(msg) { $("status").textContent = msg; }
@@ -270,26 +286,29 @@ async function onCapture() {
       log(`VERSION failed (continuing): ${err.message}`);
     }
 
-    // ---- USB-2 slow mode (experimental) -----------------------------------
-    // Full-res over a USB-2 High-Speed link: slow the sensor's VT clock so
-    // pixels are PRODUCED slower than USB 2 drains (~35-40 MB/s). The captured
-    // init runs the clock tree at 12 MHz ext -> PLL -> VT_CLK_DIV (0x0227)=5
-    // -> 160.8 MHz VT clock -> ~115 MB/s wire rate @ 60 fps. Multiplying the
-    // divider by N divides the wire rate (and fps) by N. Exposure is counted
-    // in LINES (0x044E=1000), so scale it down by N to keep brightness.
+    // ---- USB-2 slow mode: LINE STRETCH (experimental) ---------------------
+    // Full-res over a USB-2 High-Speed link by slowing pixel OUTPUT, without
+    // touching the clock tree (a VT_CLK_DIV change wedged the sensor —
+    // SYSTEM_FSM read 0xFF, i.e. dead I2C). LINE_LENGTH (0x0300, statics page,
+    // hardware readback = 1236 VT clocks = 7.69 us/line = 60 fps at 2168
+    // lines/frame) sets the time between line readouts: multiplying it by N
+    // stretches line blanking, dividing the wire rate and fps by N while the
+    // PLL/MIPI stay at ST's exact captured values. Exposure is counted in
+    // LINES (0x044E=1000) and each line is now N x longer, so scale it 1/N.
     const slowFactor = parseInt($("slowmode").value, 10) || 1;
+    const LINE_LENGTH_DEFAULT = 1236;
     let mods = null;
     if (slowFactor > 1) {
-      const div = 5 * slowFactor;              // VT_CLK_DIV: 20 / 30 / 60
+      const lineLen = LINE_LENGTH_DEFAULT * slowFactor;   // 4944 / 7416 / 14832 (u16 ok)
       const exp = Math.max(1, Math.round(1000 / slowFactor));
       mods = {
-        0x0227: [div & 0xff],
-        0x044E: [exp & 0xff, (exp >> 8) & 0xff],
+        overrides: { 0x044E: [exp & 0xff, (exp >> 8) & 0xff] },
+        preStart: [{ reg: 0x0300, val: [lineLen & 0xff, (lineLen >> 8) & 0xff] }],
       };
-      log(`USB-2 slow mode ${slowFactor}x: VT_CLK_DIV 5 -> ${div}, ` +
-          `COARSE_EXPOSURE 1000 -> ${exp} (~${(114.6 / slowFactor).toFixed(1)} MB/s, ` +
-          `~${(60 / slowFactor).toFixed(0)} fps). EXPERIMENTAL — if the sensor rejects ` +
-          `the divider you'll see "command not consumed" / "SYSTEM_FSM=2" below.`);
+      log(`USB-2 slow mode ${slowFactor}x (line stretch): LINE_LENGTH 0x0300 ` +
+          `${LINE_LENGTH_DEFAULT} -> ${lineLen}, COARSE_EXPOSURE 1000 -> ${exp} ` +
+          `(~${(114.6 / slowFactor).toFixed(1)} MB/s, ~${(60 / slowFactor).toFixed(0)} fps). ` +
+          `No clock changes. EXPERIMENTAL.`);
     }
 
     // ---- Cold-init: replay the hardware-captured sequence (PROTOCOL.md §9) --
@@ -301,6 +320,20 @@ async function onCapture() {
     const { width, height } = geo;
     bpp = geo.bpp;
     log(`Cold-init replayed: streaming ${width}x${height} bpp=${bpp} (no patch).`);
+
+    // Slow-mode readback: did the sensor ACCEPT the stretched line length?
+    // (If it clamps back to ~1236, full-rate video will stall on USB 2 and we
+    // know to try a different register rather than a different value.)
+    if (mods) {
+      try {
+        const ll = await sensor.read16(0x0300);
+        const fsm = await sensor.read8(0x0028);
+        log(`Slow-mode readback: LINE_LENGTH(0x0300)=${ll} ` +
+            `(wanted ${LINE_LENGTH_DEFAULT * slowFactor}), SYSTEM_FSM=${fsm}.`);
+      } catch (err) {
+        log(`Slow-mode readback failed: ${err.message}`);
+      }
+    }
 
     // ---- Read ONE frame off the video bulk-IN (PROTOCOL.md §5.0) ---------
     // PRE-QUEUED single transfer: stop the stream, queue the frame-sized read,
@@ -381,7 +414,7 @@ function renderFrame(frame) {
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16d (USB-2 slow mode: VT-clock retune for full-res over HighSpeed)";
+const APP_BUILD = "2026-07-16e (slow mode via LINE_LENGTH stretch — no clock changes; buffered log)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);
