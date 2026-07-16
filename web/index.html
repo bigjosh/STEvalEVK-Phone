@@ -83,6 +83,12 @@
       </label>
     </div>
     <div class="row">
+      <label>exposure mode
+        <select id="expmode" style="padding:.3rem;font-size:.9rem;">
+          <option value="manual" selected>Manual (slider)</option>
+          <option value="auto">Auto (AE warm-up ~1 s)</option>
+        </select>
+      </label>
       <label style="flex:1;min-width:14rem;">
         <span>exposure: <span id="expmsval">15.0</span> ms</span>
         <input type="range" id="expms" min="0.5" max="65" step="0.5" value="15"

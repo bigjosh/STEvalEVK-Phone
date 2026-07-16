@@ -348,6 +348,38 @@ export class Cx3Console {
     }
     throw new Error(msg);
   }
+
+  /**
+   * AE warm-up capture: get the first frame via readFramePrequeued, then keep
+   * reading frames back-to-back for ~`warmupFrames` more and return the LAST
+   * good one — by then the sensor's auto-exposure (active with the captured
+   * init: CTX0_EXP_MODE 0x044C = 0) has converged on the scene. Requires the
+   * link to keep up continuously (fine in slow mode / on SuperSpeed); a
+   * mid-sequence stall is recovered with clearHalt and simply costs a frame.
+   * @param {Vd56g3} sensor
+   * @param {number} wireTotal
+   * @param {number} [warmupFrames]
+   * @returns {Promise<Uint8Array>}
+   */
+  async readFrameWarmup(sensor, wireTotal, warmupFrames = 15) {
+    const first = await this.readFramePrequeued(sensor, wireTotal);
+    const request = Math.ceil((wireTotal + 65536) / 1024) * 1024;
+    let kept = first;
+    let got = 1;
+    const tEnd = performance.now() + 5000; // hard cap
+    while (got < warmupFrames && performance.now() < tEnd) {
+      try {
+        const rd = await this.device.transferIn(this.videoIn, request);
+        if (rd.status === "stall") throw new Error("stall");
+        const d = new Uint8Array(rd.data.buffer, rd.data.byteOffset, rd.data.byteLength);
+        if (d.length >= wireTotal && isFrameStart(d)) { kept = d; got++; }
+      } catch (_) {
+        try { await this.device.clearHalt("in", this.videoIn); } catch (_2) { /* ignore */ }
+      }
+    }
+    this.log(`AE warm-up: kept frame ${got}/${warmupFrames}.`);
+    return kept;
+  }
 }
 
 // =============================================================================

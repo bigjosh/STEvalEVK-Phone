@@ -313,21 +313,29 @@ async function onCapture() {
     const VT_CLOCK_HZ = 160.8e6;
     const FRAME_LENGTH_LINES = 2168;    // captured 0x0458 value
 
-    // ---- Manual exposure (slider, in ms) ----------------------------------
-    // COARSE_EXPOSURE (0x044E) counts LINE PERIODS, and the line period is
-    // LINE_LENGTH/VT_CLOCK (stretched by the slow-mode factor). We capture the
-    // FIRST frame after stream start, so auto-exposure never gets a chance to
-    // adapt — the frame uses exactly this value.
+    // ---- Exposure ----------------------------------------------------------
+    // The captured init sets CTX0_EXP_MODE (0x044C) = 0 = AUTO: the sensor's
+    // AE controller owns COARSE_EXPOSURE, so writing 0x044E alone does nothing
+    // (observed: the slider had no effect). Manual mode overrides 0x044C to 2
+    // (manual) so the slider value sticks; Auto mode leaves AE on and instead
+    // warms it up by streaming ~15 frames and keeping the last.
+    const manualExposure = $("expmode").value === "manual";
     const linePeriodS = (LINE_LENGTH_DEFAULT * slowFactor) / VT_CLOCK_HZ;
     const wantMs = parseFloat($("expms").value) || 15;
     const expLines = Math.min(FRAME_LENGTH_LINES - 8,
                               Math.max(1, Math.round(wantMs / 1000 / linePeriodS)));
     const effMs = expLines * linePeriodS * 1000;
-    log(`Exposure: ${wantMs.toFixed(1)} ms requested -> COARSE_EXPOSURE=${expLines} lines ` +
-        `(${effMs.toFixed(1)} ms effective at ${(linePeriodS * 1e6).toFixed(1)} us/line` +
-        `${effMs < wantMs - 0.3 ? " — CLAMPED by frame length; slower mode allows longer" : ""}).`);
-
-    let mods = { overrides: { 0x044E: [expLines & 0xff, (expLines >> 8) & 0xff] } };
+    let mods = { overrides: {} };
+    if (manualExposure) {
+      mods.overrides[0x044C] = [0x02]; // CTX0_EXP_MODE: 0=auto -> 2=manual (empirical test)
+      mods.overrides[0x044E] = [expLines & 0xff, (expLines >> 8) & 0xff];
+      log(`Manual exposure: ${wantMs.toFixed(1)} ms -> COARSE_EXPOSURE=${expLines} lines ` +
+          `(${effMs.toFixed(1)} ms effective at ${(linePeriodS * 1e6).toFixed(1)} us/line` +
+          `${effMs < wantMs - 0.3 ? " — CLAMPED by frame length; slower mode allows longer" : ""}), ` +
+          `EXP_MODE 0 -> 2.`);
+    } else {
+      log(`Auto exposure: AE stays on; will stream ~15 warm-up frames and keep the last.`);
+    }
     if (slowFactor > 1) {
       const lineLen = LINE_LENGTH_DEFAULT * slowFactor;   // 4944 / 7416 / 14832 (u16 ok)
       mods.preStart = [{ reg: 0x0300, val: [lineLen & 0xff, (lineLen >> 8) & 0xff] }];
@@ -347,18 +355,22 @@ async function onCapture() {
     bpp = geo.bpp;
     log(`Cold-init replayed: streaming ${width}x${height} bpp=${bpp} (no patch).`);
 
-    // Slow-mode readback: did the sensor ACCEPT the stretched line length?
-    // (If it clamps back to ~1236, full-rate video will stall on USB 2 and we
-    // know to try a different register rather than a different value.)
-    if (mods) {
-      try {
-        const ll = await sensor.read16(0x0300);
-        const fsm = await sensor.read8(0x0028);
-        log(`Slow-mode readback: LINE_LENGTH(0x0300)=${ll} ` +
-            `(wanted ${LINE_LENGTH_DEFAULT * slowFactor}), SYSTEM_FSM=${fsm}.`);
-      } catch (err) {
-        log(`Slow-mode readback failed: ${err.message}`);
+    // Readback: did the sensor ACCEPT what we changed? (A clamped/rejected
+    // value shows up here before we waste a frame read on it.)
+    try {
+      const parts = [];
+      if (slowFactor > 1) {
+        parts.push(`LINE_LENGTH(0x0300)=${await sensor.read16(0x0300)} ` +
+                   `(wanted ${LINE_LENGTH_DEFAULT * slowFactor})`);
       }
+      if (manualExposure) {
+        parts.push(`EXP_MODE(0x044C)=${await sensor.read8(0x044C)} (wanted 2)`);
+        parts.push(`COARSE_EXPOSURE(0x044E)=${await sensor.read16(0x044E)} (wanted ${expLines})`);
+      }
+      parts.push(`SYSTEM_FSM=${await sensor.read8(0x0028)}`);
+      log(`Readback: ${parts.join(", ")}.`);
+    } catch (err) {
+      log(`Readback failed: ${err.message}`);
     }
 
     // ---- Read ONE frame off the video bulk-IN (PROTOCOL.md §5.0) ---------
@@ -372,7 +384,9 @@ async function onCapture() {
     const wireTotal = wireFrameSize(payloadSize);    // + 16 B header/footer per 16 KB chunk
     log(`Expecting ${wireTotal} wire bytes (payload ${payloadSize}).`);
     const t0 = performance.now();
-    const raw = await state.console.readFramePrequeued(sensor, wireTotal);
+    const raw = manualExposure
+      ? await state.console.readFramePrequeued(sensor, wireTotal)
+      : await state.console.readFrameWarmup(sensor, wireTotal, 15);
     const dt = (performance.now() - t0) / 1000;
     log(`Read ${raw.length} wire bytes in ${dt.toFixed(2)} s ` +
         `(~${(raw.length / dt / 1e6).toFixed(1)} MB/s incl. stream start).`);
@@ -440,7 +454,7 @@ function renderFrame(frame) {
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16f (manual exposure slider; canvas clear on capture; 4x default)";
+const APP_BUILD = "2026-07-16g (manual exposure via EXP_MODE=2 + AE warm-up mode; readbacks)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);
