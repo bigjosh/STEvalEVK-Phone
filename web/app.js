@@ -10,8 +10,8 @@
 
 import {
   Cx3Console, Vd56g3,
-  replayColdInit, decodeFrame, wireFrameSize,
-} from "./protocol.js?v=16m"; // ?v= keeps protocol.js in lockstep with app.js
+  replayColdInit, decodeFrame, wireFrameSize, encodeGrayPng,
+} from "./protocol.js?v=16n"; // ?v= keeps protocol.js in lockstep with app.js
 
 // VID:PID of the EVK (PROTOCOL.md §1).
 const VENDOR_ID = 0x0553;
@@ -461,10 +461,12 @@ function renderFrame(frame) {
   }
   ctx.putImageData(imgData, 0, 0);
 
-  // Export a PNG (lossless) via canvas.toBlob and enable the download link.
+  // Export a FULL-BIT-DEPTH grayscale PNG (our own encoder — canvas.toBlob is
+  // 8-bit only): RAW10 -> 16-bit gray PNG with samples left-aligned
+  // (v16 = v<<6|v>>4; recover the 10-bit value as v16>>6). RAW8 -> 8-bit PNG.
   // Filename is a datetime stamp so successive captures never collide.
-  canvas.toBlob((blob) => {
-    if (!blob) { log("toBlob returned null — PNG export unavailable."); return; }
+  const depthBits = frame.maxValue > 255 ? 16 : 8;
+  encodeGrayPng(frame.pixels, frame.width, frame.height, frame.maxValue).then((blob) => {
     const link = $("download");
     if (link.href) URL.revokeObjectURL(link.href);
     link.href = URL.createObjectURL(blob);
@@ -473,15 +475,15 @@ function renderFrame(frame) {
     link.download = `evk_${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}` +
                     `_${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}.png`;
     link.classList.remove("disabled");
-    link.textContent = `Download PNG (${(blob.size / 1024).toFixed(0)} KB, lossless)`;
-    log(`PNG ready (${blob.size} bytes) as ${link.download}.`);
-  }, "image/png");
+    link.textContent = `Download PNG (${depthBits}-bit gray, ${(blob.size / 1024).toFixed(0)} KB)`;
+    log(`PNG ready: ${depthBits}-bit grayscale, ${blob.size} bytes, ${link.download}.`);
+  }).catch((err) => log(`PNG encode failed: ${err.message}`));
 }
 
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16m (lossless PNG export; datetime-stamped filenames)";
+const APP_BUILD = "2026-07-16n (16-bit grayscale PNG export — full 10-bit sensor data, own encoder)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);

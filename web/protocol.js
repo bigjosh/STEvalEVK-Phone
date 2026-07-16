@@ -870,6 +870,90 @@ export function stripWireChunks(raw) {
 }
 
 // =============================================================================
+// Grayscale PNG encoder (dependency-free) — full-bit-depth export
+// =============================================================================
+// PNG grayscale supports bit depths 8 and 16 (no native 10). RAW10 samples are
+// stored LEFT-ALIGNED in 16-bit: v16 = (v<<6)|(v>>4), so 0->0, 1023->65535 and
+// the original is recovered exactly with v = v16>>6. zlib layer comes from the
+// browser-native CompressionStream("deflate") (the "deflate" format is
+// zlib-wrapped per the Compression Streams spec, which is what IDAT needs).
+
+const _crcTable = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function _crc32(...arrays) {
+  let c = 0xFFFFFFFF;
+  for (const a of arrays) {
+    for (let i = 0; i < a.length; i++) c = _crcTable[(c ^ a[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function _pngChunk(type, data) {
+  const out = new Uint8Array(12 + data.length);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  dv.setUint32(8 + data.length, _crc32(out.subarray(4, 8), data));
+  return out;
+}
+
+/**
+ * Encode a grayscale PNG from row-major samples.
+ * @param {Uint8Array|Uint16Array} pixels row-major samples, values 0..maxValue
+ * @param {number} width
+ * @param {number} height
+ * @param {number} maxValue 255 -> 8-bit PNG; anything larger -> 16-bit PNG
+ *   with samples scaled to full 16-bit range (invertible for 1023: v16>>6).
+ * @returns {Promise<Blob>} image/png
+ */
+export async function encodeGrayPng(pixels, width, height, maxValue) {
+  const depth16 = maxValue > 255;
+  const stride = width * (depth16 ? 2 : 1);
+  const raw = new Uint8Array(height * (1 + stride));
+  let o = 0;
+  for (let y = 0; y < height; y++) {
+    raw[o++] = 0; // per-scanline filter byte: 0 = None
+    const base = y * width;
+    if (depth16) {
+      for (let x = 0; x < width; x++) {
+        const v = pixels[base + x];
+        const v16 = maxValue === 1023 ? ((v << 6) | (v >> 4))
+                                      : Math.round((v * 65535) / maxValue);
+        raw[o++] = (v16 >> 8) & 0xff;  // PNG samples are big-endian
+        raw[o++] = v16 & 0xff;
+      }
+    } else {
+      for (let x = 0; x < width; x++) raw[o++] = pixels[base + x];
+    }
+  }
+  const zstream = new Blob([raw]).stream().pipeThrough(new CompressionStream("deflate"));
+  const idat = new Uint8Array(await new Response(zstream).arrayBuffer());
+
+  const ihdr = new Uint8Array(13);
+  const dv = new DataView(ihdr.buffer);
+  dv.setUint32(0, width);
+  dv.setUint32(4, height);
+  ihdr[8] = depth16 ? 16 : 8; // bit depth
+  ihdr[9] = 0;                // color type 0 = grayscale
+  // bytes 10-12: compression 0, filter 0, interlace 0
+
+  const sig = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+  return new Blob(
+    [sig, _pngChunk("IHDR", ihdr), _pngChunk("IDAT", idat), _pngChunk("IEND", new Uint8Array(0))],
+    { type: "image/png" },
+  );
+}
+
+// =============================================================================
 // Frame decode (PROTOCOL.md §5, mirrors ST vdx6gx_frame_decoding.py exactly)
 // =============================================================================
 
