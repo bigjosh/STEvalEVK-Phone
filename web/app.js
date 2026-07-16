@@ -234,8 +234,9 @@ async function onConnect() {
       log(`*** video overflows the CX3 and stalls. Slow mode retunes the sensor's VT`);
       log(`*** clock so full-res frames fit through USB 2 at a lower frame rate.`);
       if ($("slowmode").value === "1") {
-        $("slowmode").value = "6";
-        log(`Auto-selected "USB-2 slow mode: 6x" (~19 MB/s). Change it in Options if needed.`);
+        $("slowmode").value = "4";
+        log(`Auto-selected "USB-2 slow mode: 4x" (~29 MB/s, ~15 fps — the proven ` +
+            `setting; 12x is known to fault the sensor). Change it in Options if needed.`);
       }
     } else {
       log(`Link looks SuperSpeed (video max packet = ${pkt}). Good for full-rate video.`);
@@ -273,6 +274,18 @@ function onDisconnect(event) {
 async function onCapture() {
   if (!state.sensor) { setStatus("Not connected."); return; }
   $("capture").disabled = true;
+  // Clear the previous image + download link so a fresh capture is unambiguous.
+  {
+    const canvas = $("preview");
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#222";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const link = $("download");
+    if (link.href) URL.revokeObjectURL(link.href);
+    link.removeAttribute("href");
+    link.classList.add("disabled");
+    link.textContent = "Download JPEG";
+  }
   try {
     let bpp = parseInt($("bpp").value, 10) === 10 ? 10 : 8; // replay overrides this
     const sensor = state.sensor;
@@ -296,19 +309,32 @@ async function onCapture() {
     // PLL/MIPI stay at ST's exact captured values. Exposure is counted in
     // LINES (0x044E=1000) and each line is now N x longer, so scale it 1/N.
     const slowFactor = parseInt($("slowmode").value, 10) || 1;
-    const LINE_LENGTH_DEFAULT = 1236;
-    let mods = null;
+    const LINE_LENGTH_DEFAULT = 1236;   // VT clocks (hardware readback)
+    const VT_CLOCK_HZ = 160.8e6;
+    const FRAME_LENGTH_LINES = 2168;    // captured 0x0458 value
+
+    // ---- Manual exposure (slider, in ms) ----------------------------------
+    // COARSE_EXPOSURE (0x044E) counts LINE PERIODS, and the line period is
+    // LINE_LENGTH/VT_CLOCK (stretched by the slow-mode factor). We capture the
+    // FIRST frame after stream start, so auto-exposure never gets a chance to
+    // adapt — the frame uses exactly this value.
+    const linePeriodS = (LINE_LENGTH_DEFAULT * slowFactor) / VT_CLOCK_HZ;
+    const wantMs = parseFloat($("expms").value) || 15;
+    const expLines = Math.min(FRAME_LENGTH_LINES - 8,
+                              Math.max(1, Math.round(wantMs / 1000 / linePeriodS)));
+    const effMs = expLines * linePeriodS * 1000;
+    log(`Exposure: ${wantMs.toFixed(1)} ms requested -> COARSE_EXPOSURE=${expLines} lines ` +
+        `(${effMs.toFixed(1)} ms effective at ${(linePeriodS * 1e6).toFixed(1)} us/line` +
+        `${effMs < wantMs - 0.3 ? " — CLAMPED by frame length; slower mode allows longer" : ""}).`);
+
+    let mods = { overrides: { 0x044E: [expLines & 0xff, (expLines >> 8) & 0xff] } };
     if (slowFactor > 1) {
       const lineLen = LINE_LENGTH_DEFAULT * slowFactor;   // 4944 / 7416 / 14832 (u16 ok)
-      const exp = Math.max(1, Math.round(1000 / slowFactor));
-      mods = {
-        overrides: { 0x044E: [exp & 0xff, (exp >> 8) & 0xff] },
-        preStart: [{ reg: 0x0300, val: [lineLen & 0xff, (lineLen >> 8) & 0xff] }],
-      };
+      mods.preStart = [{ reg: 0x0300, val: [lineLen & 0xff, (lineLen >> 8) & 0xff] }];
       log(`USB-2 slow mode ${slowFactor}x (line stretch): LINE_LENGTH 0x0300 ` +
-          `${LINE_LENGTH_DEFAULT} -> ${lineLen}, COARSE_EXPOSURE 1000 -> ${exp} ` +
+          `${LINE_LENGTH_DEFAULT} -> ${lineLen} ` +
           `(~${(114.6 / slowFactor).toFixed(1)} MB/s, ~${(60 / slowFactor).toFixed(0)} fps). ` +
-          `No clock changes. EXPERIMENTAL.`);
+          `No clock changes.`);
     }
 
     // ---- Cold-init: replay the hardware-captured sequence (PROTOCOL.md §9) --
@@ -414,12 +440,15 @@ function renderFrame(frame) {
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16e (slow mode via LINE_LENGTH stretch — no clock changes; buffered log)";
+const APP_BUILD = "2026-07-16f (manual exposure slider; canvas clear on capture; 4x default)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);
   $("connect").addEventListener("click", onConnect);
   $("capture").addEventListener("click", onCapture);
+  $("expms").addEventListener("input", () => {
+    $("expmsval").textContent = parseFloat($("expms").value).toFixed(1);
+  });
   if (!("usb" in navigator)) {
     setStatus("WebUSB not supported in this browser.");
     log("WebUSB not available. Requires Chrome for Android (or desktop Chrome) over HTTPS.");

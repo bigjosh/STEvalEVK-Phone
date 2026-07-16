@@ -82,6 +82,13 @@
         </select>
       </label>
     </div>
+    <div class="row">
+      <label style="flex:1;min-width:14rem;">
+        <span>exposure: <span id="expmsval">15.0</span> ms</span>
+        <input type="range" id="expms" min="0.5" max="65" step="0.5" value="15"
+               style="width:100%;">
+      </label>
+    </div>
     <p class="hint">Leave endpoint fields blank to auto-discover from the interface descriptors (first bulk-OUT = command, small bulk-IN = answer, large bulk-IN = video).</p>
   </fieldset>
 
