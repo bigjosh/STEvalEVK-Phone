@@ -26,26 +26,30 @@ three files (`index.html`, `app.js`, `protocol.js`) served over HTTPS.
 - A **SuperSpeed (5 Gbps) USB cable/OTG path** — the video bulk stream starves on
   USB 2 (PROTOCOL.md §1).
 
-## Deploy on GitHub Pages
+## Deploy on GitHub Pages (automated)
 
-1. Push this repo to GitHub.
-2. Repo **Settings → Pages** → *Build and deployment* → **Deploy from a branch**,
-   pick your branch and `/ (root)`.
-3. The app is served at `https://<user>.github.io/<repo>/web/`. Open that URL in
-   **Chrome for Android**.
-4. Tap **Connect**, choose the EVK in the chooser (filtered to VID `0x0553`,
-   PID `0x040A`), then **Capture frame**.
+The [`deploy-pages`](../.github/workflows/pages.yml) workflow builds and deploys
+this on every push to `main` that touches `web/` or `firmware/`. It assembles a
+site root = `web/` contents **plus a `firmware/` subdir** (so the app can fetch
+the captured init sequence at `firmware/vd56g3_cold_init.json`), then publishes it.
 
-> GitHub Pages is HTTPS by default, which satisfies WebUSB's secure-context
-> requirement. No server code runs — it is entirely static.
+- One-time: **Settings → Pages → Build and deployment → Source = GitHub Actions**
+  (the workflow will try to enable this automatically).
+- App URL: **`https://<user>.github.io/<repo>/`** (served at the site root, not
+  `/web/`). Open it in **Chrome for Android**.
+- Tap **Connect**, choose the EVK (chooser filtered to VID `0x0553` / PID
+  `0x040A`), then **Capture frame**.
 
-### VT patch path (fetch)
+> Pages is HTTPS by default, satisfying WebUSB's secure-context requirement. No
+> server code runs — entirely static.
 
-`protocol.js` fetches the VT patch from **`../firmware/vd56g3_vt_patch.json`**
-(relative to `web/`), i.e. the repo's `firmware/` folder — so keep the whole repo
-published, or **copy `firmware/vd56g3_vt_patch.json` next to the web app** and
-change the URL passed to `loadVtPatch(sensor, url)` in `app.js`. Same-origin
-fetch under Pages needs no CORS config.
+### Firmware fetch path
+
+`replayColdInit` fetches `firmware/vd56g3_cold_init.json` (the hardware-captured
+sequence — no patch needed). It tries `firmware/…` first (the deployed layout,
+where the action copies `firmware/` next to `index.html`) and falls back to
+`../firmware/…` (repo served at `/web/`), so the same code works in dev and
+deployed. Same-origin fetch under Pages needs no CORS config.
 
 ## How it initializes (no firmware patch needed)
 

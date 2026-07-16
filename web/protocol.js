@@ -420,10 +420,25 @@ export class Vd56g3 {
  * @param {string} [url]
  * @returns {Promise<{width:number,height:number,bpp:number}>}
  */
-export async function replayColdInit(sensor, url = "../firmware/vd56g3_cold_init.json") {
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`cold-init fetch failed: HTTP ${resp.status} (${url})`);
-  const doc = await resp.json();
+export async function fetchFirmwareJson(name) {
+  // Resolve firmware/ whether it sits alongside the page (Pages deploy: the
+  // action copies firmware/ next to index.html) or one level up (repo served at
+  // /web/). Tries both so the same code works in dev and deployed.
+  const tried = [];
+  for (const url of [`firmware/${name}`, `../firmware/${name}`]) {
+    tried.push(url);
+    try {
+      const r = await fetch(url);
+      if (r.ok) return await r.json();
+    } catch (_) { /* try next */ }
+  }
+  throw new Error(`could not fetch ${name} (tried ${tried.join(", ")})`);
+}
+
+export async function replayColdInit(sensor, url) {
+  const doc = url
+    ? await (async () => { const r = await fetch(url); if (!r.ok) throw new Error(`cold-init fetch failed: HTTP ${r.status} (${url})`); return r.json(); })()
+    : await fetchFirmwareJson("vd56g3_cold_init.json");
   const writes = {};
   let bpp = 8;
   for (const step of doc.steps) {

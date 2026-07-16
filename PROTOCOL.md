@@ -74,19 +74,23 @@ trusted for the phone replay (see `DECISIONS_QUEUE.md`).
 | Sensor | VD56G3 ("S6G3"), 1124×1364 mono global shutter, RAW8/RAW10 | handoff + binary |
 | Sensor I²C addr | `0x20` (8-bit write addr; 7-bit `0x10`) — default in `image_sensor_python_sdk.py` | Python SDK |
 
-The device is composite; the handoff observed `MI_00` = "Stream". The CX3 console
-uses **three bulk endpoints** — **[capture-confirmed]** addresses from
-`captures/steval-connect` (§8):
+**[capture-confirmed] from the EVK's own device+config descriptors** (device addr
+49, VID 0x0553, bcdUSB **3.00**, bDeviceClass **0xEF** = Misc/IAD; 1 configuration,
+**2 vendor-specific (0xFF) interfaces**). The three bulk endpoints are **split
+across the two interfaces**:
 
-| role | address | notes |
-|---|---|---|
-| **command OUT** (console request) | **`0x05`** | board struct offset `+0x24` |
-| **answer IN** (console reply)     | **`0x85`** | board struct offset `+0x25`; pairs with 0x05 by endpoint number |
-| **video IN** (streaming payload)  | **`0x83`** | async `libusb_submit_transfer` in `cx3_stream_start` |
+| role | address | interface | type/mps |
+|---|---|---|---|
+| **video IN** (streaming payload)  | **`0x83`** | **interface 0** (1 EP) | bulk, 1024 |
+| **command OUT** (console request) | **`0x05`** | **interface 1** (2 EP) | bulk, 1024 |
+| **answer IN** (console reply)     | **`0x85`** | **interface 1**        | bulk, 1024 |
 
-Auto-discovery pairs answer-IN to command-OUT by endpoint number (0x05 ↔ 0x85)
-and treats the other bulk-IN (0x83) as video — matching these observed
-addresses; explicit overrides remain available.
+So a host must **claim both interfaces**: console (0x05/0x85) on interface 1,
+video (0x83) on interface 0. The Python host does this (console interface +
+cross-interface video discovery); the WebUSB app claims every interface the three
+endpoints live on. Overrides remain available. (The earlier "firehose" endpoint
+tallies in §8 were before filtering by device address — this table is the EVK's
+real descriptor.)
 
 ---
 

@@ -1,0 +1,49 @@
+name: deploy-pages
+
+# Publishes the Phase-2 WebUSB app (web/) to GitHub Pages. The app fetches the
+# hardware-captured init sequence from firmware/*.json, so we assemble a site
+# root = web/ contents + a firmware/ subdir next to index.html.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "firmware/*.json"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; don't cancel an in-progress one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble site (web/ + firmware/)
+        run: |
+          mkdir -p _site/firmware
+          cp -r web/. _site/
+          cp firmware/*.json _site/firmware/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

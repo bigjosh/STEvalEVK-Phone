@@ -35,8 +35,7 @@ function setStatus(msg) { $("status").textContent = msg; }
 // Shared app state.
 const state = {
   device: null,
-  iface: null,
-  alt: null,
+  claimedInterfaces: [],
   console: null,
   sensor: null,
   eps: { cmdOut: null, ansIn: null, videoIn: null },
@@ -51,51 +50,44 @@ const state = {
 //   - the larger / separate bulk-IN = video
 // Never hardcoded — user can override via the number inputs on the page.
 // ===========================================================================
-function discoverEndpoints(alternate) {
+function discoverEndpoints(configuration) {
+  // The EVK is a composite USB-3 device (class 0xEF) that SPLITS its bulk
+  // endpoints across two vendor interfaces (PROTOCOL.md §1, confirmed from the
+  // device descriptor): interface 1 carries the console (OUT 0x05 / IN 0x85),
+  // interface 0 carries the video (IN 0x83). So we scan ALL interfaces, not one.
   const bulkOut = [];
   const bulkIn = [];
-  for (const ep of alternate.endpoints) {
-    if (ep.type !== "bulk") continue;
-    if (ep.direction === "out") bulkOut.push(ep);
-    else bulkIn.push(ep);
-  }
-  if (bulkOut.length < 1 || bulkIn.length < 1) {
-    throw new Error(
-      `interface has ${bulkOut.length} bulk-OUT / ${bulkIn.length} bulk-IN ` +
-      `endpoints; need >=1 OUT and >=1 IN (2 IN preferred for a separate video EP).`
-    );
-  }
-
-  // command OUT = first bulk-OUT.
-  const cmdOut = bulkOut[0].endpointNumber;
-
-  let ansIn, videoIn, videoPacketSize = 1024;
-  if (bulkIn.length >= 2) {
-    // Do NOT rank by packetSize: at SuperSpeed (this device needs the 5 Gbps
-    // cable, PROTOCOL.md §1) all bulk endpoints report the same 1024-byte
-    // packetSize and burst capacity lives in the SS companion descriptor. Pair
-    // the answer-IN with the command-OUT by endpoint NUMBER (OUT 1 <-> IN 1);
-    // the other bulk-IN is video. Fall back to descriptor order + warn.
-    const paired = bulkIn.find((e) => e.endpointNumber === cmdOut);
-    if (paired) {
-      ansIn = paired.endpointNumber;
-      const other = bulkIn.find((e) => e.endpointNumber !== paired.endpointNumber);
-      videoIn = other ? other.endpointNumber : paired.endpointNumber;
-      videoPacketSize = (other || paired).packetSize || 1024;
-    } else {
-      ansIn = bulkIn[0].endpointNumber;
-      videoIn = bulkIn[1].endpointNumber;
-      videoPacketSize = bulkIn[1].packetSize || 1024;
-      log(`endpoint pairing ambiguous (no bulk-IN matches cmd-OUT #${cmdOut}); ` +
-          `guessing ansIn=${ansIn} videoIn=${videoIn} by order — override if VERSION fails.`);
+  for (const iface of configuration.interfaces) {
+    const alt = iface.alternate || iface.alternates[0];
+    for (const ep of alt.endpoints) {
+      if (ep.type !== "bulk") continue;
+      const rec = { num: ep.endpointNumber, iface: iface.interfaceNumber, pkt: ep.packetSize || 1024 };
+      (ep.direction === "out" ? bulkOut : bulkIn).push(rec);
     }
-  } else {
-    // Only one bulk-IN: it must serve both roles (single-pipe firmware variant).
-    ansIn = bulkIn[0].endpointNumber;
-    videoIn = bulkIn[0].endpointNumber;
-    videoPacketSize = bulkIn[0].packetSize || 1024;
   }
-  return { cmdOut, ansIn, videoIn, videoPacketSize };
+  if (!bulkOut.length || !bulkIn.length) {
+    throw new Error(`need >=1 bulk-OUT and >=1 bulk-IN across the config; ` +
+      `found ${bulkOut.length} OUT / ${bulkIn.length} IN.`);
+  }
+
+  const cmd = bulkOut[0];                                    // command OUT (0x05, if1)
+  // answer IN: prefer the bulk-IN on the SAME interface as the command OUT
+  // (0x85 on if1); else same endpoint number; else first.
+  const ans = bulkIn.find((e) => e.iface === cmd.iface)
+           || bulkIn.find((e) => e.num === cmd.num)
+           || bulkIn[0];
+  // video IN: a bulk-IN on a DIFFERENT interface than the console (0x83 on if0);
+  // else any other bulk-IN; else share the answer pipe.
+  const video = bulkIn.find((e) => e.iface !== ans.iface)
+             || bulkIn.find((e) => e !== ans)
+             || ans;
+
+  return {
+    cmdOut: cmd.num, ansIn: ans.num, videoIn: video.num,
+    videoPacketSize: video.pkt,
+    // interfaces we must claim to use these endpoints:
+    interfaces: [...new Set([cmd.iface, ans.iface, video.iface])],
+  };
 }
 
 /** Read the manual endpoint override inputs; blank = auto. */
@@ -116,6 +108,7 @@ function applyOverrides(auto) {
     ansIn: ov.ansIn ?? auto.ansIn,
     videoIn: ov.videoIn ?? auto.videoIn,
     videoPacketSize: auto.videoPacketSize || 1024,
+    interfaces: auto.interfaces || [],
   };
 }
 
@@ -154,21 +147,25 @@ async function onConnect() {
     if (device.configuration === null) await device.selectConfiguration(1);
     log(`Configuration ${device.configuration.configurationValue} active.`);
 
-    // Find a vendor-specific interface that carries bulk endpoints and claim it.
-    const claimed = await claimVendorInterface(device);
-    state.iface = claimed.iface;
-    state.alt = claimed.alt;
-    log(`Claimed interface ${claimed.iface.interfaceNumber} (alt ${claimed.alt.alternateSetting}).`);
-
-    // Auto-discover endpoints, then apply any manual overrides.
-    const auto = discoverEndpoints(claimed.alt);
+    // Discover the 3 bulk endpoints across ALL interfaces, then claim every
+    // interface they live on (console on if1, video on if0 — see PROTOCOL.md §1).
+    const auto = discoverEndpoints(device.configuration);
     state.eps = applyOverrides(auto);
+    for (const ifnum of auto.interfaces) {
+      try {
+        await device.claimInterface(ifnum);
+        log(`Claimed interface ${ifnum}.`);
+      } catch (err) {
+        log(`claimInterface(${ifnum}) failed: ${err.message}`);
+      }
+    }
+    state.claimedInterfaces = auto.interfaces;
     // Reflect discovered values back into the (blank) inputs as placeholders.
     if ($("epCmd").value === "") $("epCmd").placeholder = String(auto.cmdOut);
     if ($("epAns").value === "") $("epAns").placeholder = String(auto.ansIn);
     if ($("epVideo").value === "") $("epVideo").placeholder = String(auto.videoIn);
-    log(`Endpoints -> cmdOut=${state.eps.cmdOut}, ansIn=${state.eps.ansIn}, videoIn=${state.eps.videoIn} ` +
-        `(auto: ${auto.cmdOut}/${auto.ansIn}/${auto.videoIn}) [addresses needs-capture]`);
+    log(`Endpoints -> cmdOut #${state.eps.cmdOut} (OUT), ansIn #${state.eps.ansIn} (IN), ` +
+        `videoIn #${state.eps.videoIn} (IN) on interfaces [${auto.interfaces.join(", ")}]`);
 
     // Build the console + sensor helpers.
     state.console = new Cx3Console(device, state.eps, log);
@@ -183,33 +180,6 @@ async function onConnect() {
     setStatus("Connect failed.");
     log(`ERROR (connect): ${err.message}`);
   }
-}
-
-/** Find + claim the first vendor interface exposing bulk endpoints. */
-async function claimVendorInterface(device) {
-  const cfg = device.configuration;
-  for (const iface of cfg.interfaces) {
-    // Prefer the alternate that actually has bulk endpoints.
-    for (const alt of iface.alternates) {
-      const hasBulk = alt.endpoints.some((e) => e.type === "bulk");
-      // Vendor-specific class is 0xFF; but some CX3 builds report 0x00. Accept
-      // any interface that carries bulk endpoints.
-      if (hasBulk) {
-        try {
-          await device.claimInterface(iface.interfaceNumber);
-        } catch (err) {
-          log(`claimInterface(${iface.interfaceNumber}) failed: ${err.message}`);
-          continue;
-        }
-        if (alt.alternateSetting !== 0) {
-          try { await device.selectAlternateInterface(iface.interfaceNumber, alt.alternateSetting); }
-          catch (err) { log(`selectAlternateInterface failed: ${err.message}`); }
-        }
-        return { iface, alt };
-      }
-    }
-  }
-  throw new Error("no vendor interface with bulk endpoints found");
 }
 
 function onDisconnect(event) {
@@ -247,7 +217,7 @@ async function onCapture() {
     // commands ST's GUI sent (register writes via I2CWRRD rdlen=0, CLKWR/CFG2WR/
     // NRST/IOSET/IOCFGWR), ending at CMD_STREAMING<-1.
     setStatus("Replaying captured cold-init...");
-    const geo = await replayColdInit(sensor, "../firmware/vd56g3_cold_init.json");
+    const geo = await replayColdInit(sensor);  // resolves firmware/ in dev or deployed
     const { width, height } = geo;
     bpp = geo.bpp;
     log(`Cold-init replayed: streaming ${width}x${height} bpp=${bpp} (no patch).`);
