@@ -906,6 +906,38 @@ function _pngChunk(type, data) {
   return out;
 }
 
+/** Minimal EXIF payload (TIFF-LE) for the PNG eXIf chunk: just ExposureTime. */
+function _exifData(exposureSeconds) {
+  const buf = new Uint8Array(52);
+  const dv = new DataView(buf.buffer);
+  buf[0] = 0x49; buf[1] = 0x49;          // "II" little-endian
+  dv.setUint16(2, 42, true);             // TIFF magic
+  dv.setUint32(4, 8, true);              // IFD0 offset
+  dv.setUint16(8, 1, true);              // IFD0: 1 entry
+  dv.setUint16(10, 0x8769, true);        //   ExifIFDPointer
+  dv.setUint16(12, 4, true);             //   type LONG
+  dv.setUint32(14, 1, true);             //   count
+  dv.setUint32(18, 26, true);            //   -> Exif IFD at offset 26
+  dv.setUint32(22, 0, true);             // no next IFD
+  dv.setUint16(26, 1, true);             // Exif IFD: 1 entry
+  dv.setUint16(28, 0x829A, true);        //   ExposureTime
+  dv.setUint16(30, 5, true);             //   type RATIONAL
+  dv.setUint32(32, 1, true);             //   count
+  dv.setUint32(36, 44, true);            //   -> rational at offset 44
+  dv.setUint32(40, 0, true);             // no next IFD
+  dv.setUint32(44, Math.max(1, Math.round(exposureSeconds * 1e6)), true); // numerator (us)
+  dv.setUint32(48, 1e6, true);           // denominator -> seconds
+  return buf;
+}
+
+/** tEXt chunk data: latin-1 keyword, NUL, latin-1 text. */
+function _textData(keyword, text) {
+  const s = keyword + "\x00" + text;
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+  return out;
+}
+
 /**
  * Encode a grayscale PNG from row-major samples.
  * @param {Uint8Array|Uint16Array} pixels row-major samples, values 0..maxValue
@@ -913,9 +945,12 @@ function _pngChunk(type, data) {
  * @param {number} height
  * @param {number} maxValue 255 -> 8-bit PNG; anything larger -> 16-bit PNG
  *   with samples scaled to full 16-bit range (invertible for 1023: v16>>6).
+ * @param {object} [meta] optional metadata:
+ *   { exposureSeconds?: number,        // -> standard eXIf chunk, ExposureTime
+ *     text?: Array<[keyword, value]> } // -> tEXt chunks (e.g. ["Software", ...])
  * @returns {Promise<Blob>} image/png
  */
-export async function encodeGrayPng(pixels, width, height, maxValue) {
+export async function encodeGrayPng(pixels, width, height, maxValue, meta = null) {
   const depth16 = maxValue > 255;
   const stride = width * (depth16 ? 2 : 1);
   const raw = new Uint8Array(height * (1 + stride));
@@ -947,10 +982,15 @@ export async function encodeGrayPng(pixels, width, height, maxValue) {
   // bytes 10-12: compression 0, filter 0, interlace 0
 
   const sig = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-  return new Blob(
-    [sig, _pngChunk("IHDR", ihdr), _pngChunk("IDAT", idat), _pngChunk("IEND", new Uint8Array(0))],
-    { type: "image/png" },
-  );
+  const parts = [sig, _pngChunk("IHDR", ihdr)];
+  if (meta && typeof meta.exposureSeconds === "number" && meta.exposureSeconds > 0) {
+    parts.push(_pngChunk("eXIf", _exifData(meta.exposureSeconds)));
+  }
+  if (meta && meta.text) {
+    for (const [k, v] of meta.text) parts.push(_pngChunk("tEXt", _textData(k, v)));
+  }
+  parts.push(_pngChunk("IDAT", idat), _pngChunk("IEND", new Uint8Array(0)));
+  return new Blob(parts, { type: "image/png" });
 }
 
 // =============================================================================

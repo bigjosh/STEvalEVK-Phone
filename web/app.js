@@ -11,7 +11,7 @@
 import {
   Cx3Console, Vd56g3,
   replayColdInit, decodeFrame, wireFrameSize, encodeGrayPng,
-} from "./protocol.js?v=16n"; // ?v= keeps protocol.js in lockstep with app.js
+} from "./protocol.js?v=17o"; // ?v= keeps protocol.js in lockstep with app.js
 
 // VID:PID of the EVK (PROTOCOL.md §1).
 const VENDOR_ID = 0x0553;
@@ -414,6 +414,18 @@ async function onCapture() {
     log(`Read ${raw.length} wire bytes in ${dt.toFixed(2)} s ` +
         `(~${(raw.length / dt / 1e6).toFixed(1)} MB/s incl. stream start).`);
 
+    // Read the exposure the sensor ACTUALLY applied (APPLIED_COARSE_EXPOSURE,
+    // STATUS 0x0064) while still streaming — in Auto mode this is AE's choice,
+    // not the slider. Falls back to the commanded value if the read fails.
+    let exposureMsUsed = effMs;
+    try {
+      const appliedLines = await sensor.read16(0x0064);
+      if (appliedLines > 0) exposureMsUsed = appliedLines * linePeriodS * 1000;
+      log(`Applied exposure: ${appliedLines} lines = ${exposureMsUsed.toFixed(1)} ms.`);
+    } catch (err) {
+      log(`Applied-exposure readback failed (${err.message}); using commanded value.`);
+    }
+
     // ---- Stop streaming (0x0202 <- 1, self-clearing — PROTOCOL.md §9.0) ---
     try { await sensor.stopStream(); log("Streaming stopped (CMD_STOP_STREAM 0x0202 <- 1)."); }
     catch (err) { log(`stopStream warning: ${err.message}`); }
@@ -423,7 +435,7 @@ async function onCapture() {
     const frame = decodeFrame(raw, width, bpp);
     log(`Decoded: ${frame.width}x${frame.height}, ${frame.bpp}bpp, ` +
         `frame#${frame.frameCounter}, seq=${frame.frameSeq}, ctx=${frame.currentContext}.`);
-    renderFrame(frame);
+    renderFrame(frame, exposureMsUsed);
 
     setStatus(`Frame captured: ${frame.width}x${frame.height} ${frame.bpp}bpp.`);
   } catch (err) {
@@ -444,7 +456,7 @@ async function onCapture() {
 // ===========================================================================
 // Render a decoded grayscale frame to the canvas + wire up the JPEG download.
 // ===========================================================================
-function renderFrame(frame) {
+function renderFrame(frame, exposureMs = null) {
   const canvas = $("preview");
   canvas.width = frame.width;
   canvas.height = frame.height;
@@ -466,14 +478,26 @@ function renderFrame(frame) {
   // (v16 = v<<6|v>>4; recover the 10-bit value as v16>>6). RAW8 -> 8-bit PNG.
   // Filename is a datetime stamp so successive captures never collide.
   const depthBits = frame.maxValue > 255 ? 16 : 8;
-  encodeGrayPng(frame.pixels, frame.width, frame.height, frame.maxValue).then((blob) => {
+  // Exposure metadata: a standard eXIf chunk (ExposureTime, readable by
+  // exiftool/Pillow/EXIF-aware viewers) + tEXt chunks (any PNG tool) + the
+  // floor(ms) in the filename for zero-tooling visibility.
+  const meta = {
+    exposureSeconds: exposureMs != null ? exposureMs / 1000 : undefined,
+    text: [
+      ["Software", "STEvalEVK-Phone WebUSB grab"],
+      ["Description", `VD56G3 ${frame.width}x${frame.height} RAW${frame.bpp}, frame #${frame.frameCounter}`],
+      ...(exposureMs != null ? [["ExposureTime", `${exposureMs.toFixed(1)} ms`]] : []),
+    ],
+  };
+  encodeGrayPng(frame.pixels, frame.width, frame.height, frame.maxValue, meta).then((blob) => {
     const link = $("download");
     if (link.href) URL.revokeObjectURL(link.href);
     link.href = URL.createObjectURL(blob);
     const t = new Date();
     const p = (n) => String(n).padStart(2, "0");
+    const expSuffix = exposureMs != null ? `-${Math.floor(exposureMs)}` : "";
     link.download = `evk_${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}` +
-                    `_${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}.png`;
+                    `_${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}${expSuffix}.png`;
     link.classList.remove("disabled");
     link.textContent = `Download PNG (${depthBits}-bit gray, ${(blob.size / 1024).toFixed(0)} KB)`;
     log(`PNG ready: ${depthBits}-bit grayscale, ${blob.size} bytes, ${link.download}.`);
@@ -483,7 +507,8 @@ function renderFrame(frame) {
 // ---------------------------------------------------------------------------
 // Wire up buttons on load.
 // ---------------------------------------------------------------------------
-const APP_BUILD = "2026-07-16n (16-bit grayscale PNG export — full 10-bit sensor data, own encoder)";
+const APP_BUILD = "2026-07-17o (exposure metadata: eXIf ExposureTime + tEXt chunks + -<ms> filename suffix; " +
+  "records the sensor's APPLIED exposure, incl. AE's choice in Auto mode)";
 
 window.addEventListener("DOMContentLoaded", () => {
   log(`App build: ${APP_BUILD}`);
