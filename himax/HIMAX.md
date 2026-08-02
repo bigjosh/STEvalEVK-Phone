@@ -40,22 +40,32 @@ Proven on hardware, in order:
 
 ## The cable problem (fix when back at the bench)
 
-- P-Board J1 is a **24-pin 0.5 mm FFC** (Hirose FH12-24S class), NOT the
-  22-pin RPi format. Pinout (from `datasheets/steval-cam-m0i-schematic.pdf`,
-  geometric extraction): pin 5 GPIO1, 6 NRST, 10 SDA, 11 SCL, 14/15 CLK_N/P,
-  17/18 D2_N/P, 20/21 D1_N/P, 23 P3V3, rest mostly GND.
+- P-Board J1 is electrically a **standard RPi 22-pin camera connector**
+  (0.5 mm FFC; user photo-verified 22 pins). The schematic numbers pins from
+  the opposite end vs the RPi convention (ST pin k = RPi pin 23−k) and names
+  the lanes D1/D2 where RPi says D0/D1 — but position-for-position it is the
+  RPi pinout: lanes on RPi positions 2/3 + 5/6, clock 8/9, CAM_GPIO(=NRST) 17,
+  SCL 20, SDA 21, 3V3 22. (An earlier revision of this doc claimed 24 pins —
+  that was a schematic-symbol artifact; retracted.)
 - Grove V2 J2 is the **15-pin 1.0 mm classic RPi camera** connector:
   2/3 D0_N/P, 5/6 D1_N/P, 8/9 CLK_N/P, 11 cam-GPIO (net PA1), 13 SCL, 14 SDA,
   15 3V3.
-- The current chain aligns only the power/I²C end. A correct chain must route
-  all three MIPI pairs; the intended path is
-  **P-Board →(ST's own cable that ships with STEVAL-CAM-M0I, 24-pin → RPi
-  22-pin format)→ 22↔15 RPi "Standard–Mini" adapter → Grove V2**. Both hops
-  follow RPi conventions at the 22-pin waypoint, so signals map by
-  construction. Check contact-side orientation at every hop (contacts only
-  count when facing the connector's contact side).
-- Sanity check after recabling, before power: continuity from P-Board J1
-  pins 20/21 (D1 pair) to Grove J2 pins 2/3 or 5/6.
+- So a standard **22↔15 RPi camera adapter (Pi 5 "Standard–Mini" / Pi Zero
+  style) is the correct and sufficient chain** — the concept of the current
+  setup is right. Since power/I²C (the pins at ONE physical end of the ribbon,
+  RPi 20/21/22) demonstrably pass while every MIPI pair (pins 2–15, middle +
+  other end) floats, the fault is mechanical/within the chain, not conceptual:
+  a skewed or shallow FFC seating at one hop, a creased ribbon, wrong
+  contact-side at one receptacle (partially gripping one edge), or an adapter
+  that isn't actually camera-wired.
+- Checklist: (1) re-seat every FFC end — ribbon square, fully bottomed, latch
+  closed, contacts facing each receptacle's contact side; also re-seat the
+  30-pin promodule mezzanine on the P-Board. (2) unpowered continuity:
+  P-Board J1 clock pair (3rd pair cluster from the power end) ↔ Grove J2
+  pins 8/9; and one data pair ↔ Grove 2/3 (or 5/6). (3) power up and run the
+  receiver — the flashed firmware self-probes and captures.
+- Bonus once seated: NRST rides the CAM_GPIO position, which the Grove drives
+  as PA1 — so our existing XSHUTDOWN control should genuinely work too.
 
 When the cable is right, the already-flashed firmware will hit LINK UP in its
 matrix (expected: 804 Mbps, OIF default polarity, hscnt 0x10) and immediately
