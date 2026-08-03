@@ -7,8 +7,29 @@ bring-up bible), `../PROTOCOL.md` (EVK-era protocol).
 
 ## Status 2026-08-02
 
-**Everything software works. The one blocker is physical: the MIPI pairs are
-not connected through the current FFC adapter chain.**
+**Everything software works — proven end-to-end with a real image. The one
+blocker is physical: the MIPI pairs are not connected through the current
+FFC adapter chain.**
+
+Update (same evening): the `ov5647_poc` app captured a real 1280x960 photo
+from the kit OV5647 through the IDENTICAL pipeline the VD56G3 uses
+(PATH_INP_WDMA2 raw dump -> CRC -> base64/UART -> receive_frame.py -> PNG,
+CRC verified). That validates phases 4's plumbing completely. It also gave
+the controlled baseline that settles the hardware question:
+
+- working link (OV5647), sensor idle:  stop(clk,l0,l1) = **1,1,1** (LP-11)
+- VD56G3 chain, sensor idle:           stop(clk,l0,l1) = **0,0,0** always
+
+Wired-but-idle lanes park at LP-11. The VD56G3 chain's pairs are electrically
+absent at the WE2. Eliminated so far: Grove/WE2 RX (OV streams), sensor
+module (known-good swap, streams internally, ERROR_CODE=0), sensor config
+(matrix swept every topology incl. non-continuous clock), cables (visually
+traced by the user, clear single-layer). Remaining: **P-Board MIPI routing
+(promodule mezzanine -> J1) and the physical mating at the P-Board J1 /
+adapter ends.** Suggested probe: with the VD56G3 chain powered and idle,
+measure DC on the P-Board J1 clock-pair pins — LP-11 = ~1.1-1.2 V on both
+wires if the sensor's lanes reach J1; 0 V = break upstream (mezzanine/board).
+Note: csirx_regdump() must not run while the RX is live (hangs).
 
 Proven on hardware, in order:
 1. Windows build chain: xpack ARM GCC 13.2.1 + xpack native make (devkitPro's

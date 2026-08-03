@@ -162,12 +162,28 @@ def main():
         f.write(data)
     print(f"wrote {base}.bin (exposure ~{exp_ms:.1f} ms)")
 
-    w_px = meta["w"] * 4 // 5
-    pixels = unpack_raw10(data, meta["w"], meta["h"])
-    write_pgm16(base + ".pgm", pixels, w_px, meta["h"])
-    print(f"wrote {base}.pgm ({w_px}x{meta['h']} 16-bit)")
-    if try_write_png(base + ".png", pixels, w_px, meta["h"]):
-        print(f"wrote {base}.png")
+    if meta["len"] == meta["w"] * meta["h"]:
+        # plain 8-bit/pixel dump (e.g., OV5647 through the same path)
+        w_px, h_px = meta["w"], meta["h"]
+        with open(base + ".pgm", "wb") as f:
+            f.write(f"P5\n{w_px} {h_px}\n255\n".encode())
+            f.write(data)
+        print(f"wrote {base}.pgm ({w_px}x{h_px} 8-bit)")
+        try:
+            from PIL import Image
+
+            Image.frombytes("L", (w_px, h_px), data).save(base + ".png")
+            print(f"wrote {base}.png")
+        except Exception as e:
+            print(f"(png skipped: {e})")
+    else:
+        # packed RAW10 (5 bytes -> 4 px): the VD56G3 full-fidelity path
+        w_px = meta["w"] * 4 // 5
+        pixels = unpack_raw10(data, meta["w"], meta["h"])
+        write_pgm16(base + ".pgm", pixels, w_px, meta["h"])
+        print(f"wrote {base}.pgm ({w_px}x{meta['h']} 16-bit)")
+        if try_write_png(base + ".png", pixels, w_px, meta["h"]):
+            print(f"wrote {base}.png")
 
 
 if __name__ == "__main__":
